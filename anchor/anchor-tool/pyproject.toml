@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "anchor"
+version = "0.1.0"
+authors = [
+  { name="Anchor User", email="user@example.com" },
+]
+description = "A professional, standalone CLI for Puter-powered toolchains"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "click>=8.0.0",
+    "rich>=10.0.0",
+    "puter>=0.0.13",
+    "tomli>=2.0.0",
+]
+
+[project.scripts]
+anchor = "anchor.cli:main"

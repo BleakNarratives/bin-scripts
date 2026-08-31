@@ -1,0 +1,30 @@
+#!/bin/bash
+REPORT=~/canon_report.json
+echo "{\"timestamp\":\"$(date -Iseconds)\", \"checks\": [" > $REPORT
+
+# 1. integrity monitor
+[ -x ~/integrity_monitor.sh ] && OUT=$(~/integrity_monitor.sh 2>&1 | head -c 400 | tr '\n' ' ') || OUT="missing"
+echo "{\"tool\":\"integrity\", \"out\":\"$OUT\"}," >> $REPORT
+
+# 2. setup_bridge (now executable)
+[ -x ~/setup_bridge.sh ] && OUT=$(~/setup_bridge.sh --dry-run 2>&1 | head -c 400 | tr '\n' ' ') || OUT="not exec"
+echo "{\"tool\":\"setup_bridge\", \"out\":\"$OUT\"}," >> $REPORT
+
+# 3. recovery_hound
+[ -x ~/recovery_hound.sh ] && OUT=$(~/recovery_hound.sh --status 2>&1 | head -c 400 | tr '\n' ' ') || OUT="missing"
+echo "{\"tool\":\"recovery_hound\", \"out\":\"$OUT\"}," >> $REPORT
+
+# 4. REAL overseer from cloud_bridge
+if [ -f ~/cloud_bridge/overseer.py ]; then
+    OUT=$(python3 ~/cloud_bridge/overseer.py --status 2>&1 | head -c 400 | tr '\n' ' ')
+    echo "{\"tool\":\"overseer\", \"out\":\"$OUT\"}," >> $REPORT
+else
+    echo "{\"tool\":\"overseer\", \"out\":\"not found\"}," >> $REPORT
+fi
+
+# 5. survival bridge (updated path)
+OUT=$(python3 ~/Canon/survival.py 2>&1 | tr '\n' ' ')
+echo "{\"tool\":\"canon\", \"out\":\"$OUT\"}" >> $REPORT
+
+echo "]}" >> $REPORT
+cat $REPORT

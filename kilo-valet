@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+# kilo-valet — launch Kilo Code with vault-sourced API keys
+# Uses the vault/concierge/valet system, not naked .env files
+#
+# Usage:
+#   kilo-valet run "your prompt"         # headless run
+#   kilo-valet serve                      # headless server
+#   kilo-valet                             # interactive TUI (default)
+#   kilo-valet --model groq/llama-3.3-70b-versatile run "prompt"
+#
+# All args after the wrapper are passed through to kilo.
+
+# Source the vault (exports OPENROUTER_API_KEY, GROQ_API_KEY, etc.)
+. "$HOME/bin/vault-env"
+
+# Ensure local llama-server is running for the local-llama provider
+# (non-blocking, silent — only matters if --model local-llama/ is used)
+if ! curl -sf http://127.0.0.1:8890/health 2>/dev/null | grep -q '"ok"'; then
+  "$HOME/bin/llama-serve.sh" start >/dev/null 2>&1 &
+fi
+
+# Hand off to kilo with all vault keys in the environment
+exec kilo "$@"

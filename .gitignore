@@ -1,0 +1,21 @@
+# Installed binaries (large) — not source, pulled separately via toolchain
+goose
+ngrok
+hermit-stable
+akasha
+akasha-sprint
+ox
+modmind-ctl
+
+# Node tooling / deps
+node_modules/
+package-lock.json
+package.json
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Backups / scratch
+*.bak
+*~

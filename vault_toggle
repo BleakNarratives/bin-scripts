@@ -1,0 +1,113 @@
+#!/usr/bin/env bash
+# vault_toggle — the Lazy Susan trapdoor between "grocery" (safe/no live keys)
+# and "speakeasy" (live keys in the CURRENT SHELL ONLY).
+#
+# SOURCE this file from .bashrc:  `[ -f "$HOME/bin/vault_toggle" ] && . "$HOME/bin/vault_toggle"`
+#
+# Why: AI coding/models should never just *see* live API keys sitting in the
+# environment. Keys load only into the shell where you *explicitly* flip to
+# speakeasy, and they vaporize when that shell closes (never persisted, never a
+# naked .env the next model reads). When the "lookouts" (random model sessions)
+# are around, you stay in grocery.
+#
+# The real key source stays ~/.concierge/vault.json, loaded by ~/bin/vault-env.
+# vault_toggle is ONLY the switch — it reuses vault-env, doesn't duplicate it.
+#
+#   vault_toggle                 # show current mode
+#   vault_toggle speakeasy       # load live keys into THIS shell from the vault
+#   vault_toggle grocery         # scrub ALL *_API_KEY/*_KEY vars from THIS shell
+#   vault_toggle auto            # flip by user-regulated condition (see below)
+#
+# User-regulated auto-conditions (all optional, run in auto mode):
+#   VLT_TRUSTED_TTY   = space-separated tty patterns (e.g. "/dev/pts/1")
+#                       only unlock if the current tty matches. Default "*".
+#   VLT_TRUST_HOST    = hostname that may hold keys (default "yes" = any).
+#   ~/.concierge/.speakeasy_signal = touch this file to allow auto speakeasy.
+#
+# Return codes: 0 = flipped, 2 = mode unchanged, 3 = missing vault, 1 = usage.
+###############################################################################
+
+VAULT_TOGGLE_LOADED="${VAULT_TOGGLE_LOADED:-0}"
+if [ "$VAULT_TOGGLE_LOADED" = "1" ] && [ "${BASH_SOURCE[0]:-}" != "${0}" ]; then
+  return 0 2>/dev/null || true    # idempotent: only define once when sourced
+fi
+
+VT_VAULT="$HOME/.concierge/vault.json"
+VT_ENV="$HOME/bin/vault-env"
+
+# The full set of key vars we know about across the ecosystem (for scrubbing).
+VT_KEY_VARS=(GROQ_API_KEY OPENROUTER_API_KEY OPENROUTER_API_KEY_POOL GEMINI_API_KEY \
+  CEREBRAS_API_KEY ANTHROPIC_API_KEY ZENMUX_API_KEY ZAI_API_KEY ORCAROUTER_API_KEY \
+  OPENAI_API_KEY MISTRAL_API_KEY COINOS_API_KEY STRIPE_SECRET_KEY \
+  GOOGLE_API_KEY JULES_API_KEY BAZAAR_API_KEY SWARMS_API_KEY \
+  EQUILEX_MASTER_KEY NOSTR_PRIVKEY BUZZ_RELAY_PRIVATE_KEY \
+  TYPESENSE_API_KEY BUZZ_S3_ACCESS_KEY BUZZ_S3_SECRET_KEY)
+
+vt_mode() {
+  echo "${CONCIERGE_MODE:-grocery}"
+}
+
+vt_scrub() {
+  local v
+  for v in "${VT_KEY_VARS[@]}"; do
+    unset "$v" 2>/dev/null
+  done
+  export CONCIERGE_MODE="grocery"
+  export _VAULT_LOADED_LIST=""
+  return 0
+}
+
+vt_speakeasy() {
+  if [ ! -f "$VT_VAULT" ]; then
+    echo "[vault] no vault at $VT_VAULT" >&2
+    return 3
+  fi
+  if [ ! -f "$VT_ENV" ]; then
+    echo "[vault] vault-env loader missing at $VT_ENV" >&2
+    return 3
+  fi
+  # clear anything first so a stale grocery/exports can't linger
+  vt_scrub >/dev/null 2>&1
+  . "$VT_ENV"          # source the existing loader -> exports live keys
+  export CONCIERGE_MODE="speakeasy"
+  return 0
+}
+
+vt_auto() {
+  # user-regulated condition gate
+  local tty="${VLT_TRUSTED_TTY:-*}" here hostok=1
+  here="$(tty 2>/dev/null || echo unknown)"
+  [ "${VLT_TRUST_HOST:-yes}" = "yes" ] || [ "$(hostname)" = "$VLT_TRUST_HOST" ] || hostok=0
+  if [ "$hostok" = "0" ]; then
+    echo "[vault] auto->grocery (host not trusted)"; vt_scrub >/dev/null 2>&1; return 0
+  fi
+  if [ -f "$HOME/.concierge/.speakeasy_signal" ]; then
+    if [ "$tty" = "*" ] || [[ "$here" == $tty* ]]; then
+      vt_speakeasy; return $?
+    fi
+  fi
+  vt_scrub >/dev/null 2>&1
+  echo "[vault] grocery (no speakeasy signal / tty not trusted)"
+  return 0
+}
+
+vault_toggle() {
+  local cmd="${1:-status}"
+  case "$cmd" in
+    speakeasy) vt_speakeasy;;
+    grocery)   vt_scrub >/dev/null 2>&1;;
+    auto)      vt_auto;;
+    status|*)  ;;
+  esac
+  echo "[vault] mode = $(vt_mode)"
+  [ "${_VAULT_LOADED_LIST:-}" != "" ] && echo "[vault] loaded: $(echo $_VAULT_LOADED_LIST)"
+  return 0
+}
+
+export VAULT_TOGGLE_LOADED=1
+
+if [ "${BASH_SOURCE[0]:-}" != "${0}" ]; then
+  return 0 2>/dev/null || true     # sourced -> define functions, return
+fi
+# executed directly -> run once against current shell is pointless; show usage
+echo "vault_toggle: source me from .bashrc, then call: vault_toggle [speakeasy|grocery|auto|status]"

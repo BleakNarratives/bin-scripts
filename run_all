@@ -1,0 +1,12 @@
+#!/bin/bash
+# Cannon loaded. Chain of command.
+# Step 1: Run the survival bridge (no emojis, pure JSON)
+python3 ~/Canon/survival.py > ~/canon_state.json
+
+# Step 2: If your overseer exists, fire it too (without breaking the pipeline)
+if [ -f ~/bin/overseer.py ]; then
+    python3 ~/bin/overseer.py --dry-run 2>> ~/canon_state.log || python3 ~/bin/overseer.py 2>> ~/canon_state.log
+fi
+
+# Step 3: Show me the money (pure JSON is in that file)
+cat ~/canon_state.json

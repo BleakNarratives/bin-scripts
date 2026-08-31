@@ -1,0 +1,53 @@
+#!/bin/bash
+# MULTIVERSE UNIFIER - Uses your existing toys, does NOT overwrite them
+set -e  # Stop on first error? NO - we collect all outputs.
+
+REPORT_FILE=~/multiverse_state.json
+LOG_FILE=~/multiverse.log
+
+# Start fresh
+echo "{\"timestamp\":\"$(date -Iseconds)\", \"steps\": [" > $REPORT_FILE
+
+# Step 1: Run your integrity monitor
+if [ -x ~/integrity_monitor.sh ]; then
+    echo "{\"tool\":\"integrity_monitor\", \"output\":\"$(~/integrity_monitor.sh 2>&1 | head -c 500 | tr '\n' ' ')\"}," >> $REPORT_FILE
+else
+    echo "{\"tool\":\"integrity_monitor\", \"error\":\"not found\"}," >> $REPORT_FILE
+fi
+
+# Step 2: Run your bridge setup (dry-run)
+if [ -x ~/setup_bridge.sh ]; then
+    echo "{\"tool\":\"setup_bridge\", \"output\":\"$(~/setup_bridge.sh --dry-run 2>&1 | head -c 500 | tr '\n' ' ')\"}," >> $REPORT_FILE
+else
+    echo "{\"tool\":\"setup_bridge\", \"error\":\"not found\"}," >> $REPORT_FILE
+fi
+
+# Step 3: Run your recovery hound (dry-run)
+if [ -x ~/recovery_hound.sh ]; then
+    echo "{\"tool\":\"recovery_hound\", \"output\":\"$(~/recovery_hound.sh --status 2>&1 | head -c 500 | tr '\n' ' ')\"}," >> $REPORT_FILE
+else
+    echo "{\"tool\":\"recovery_hound\", \"error\":\"not found\"}," >> $REPORT_FILE
+fi
+
+# Step 4: Run your overseer (if it exists)
+if [ -f ~/bin/overseer.py ]; then
+    # We capture both stdout and stderr, truncate to 500 chars to keep JSON small
+    OVOUT=$(python3 ~/bin/overseer.py --status 2>&1 | head -c 500 | tr '\n' ' ')
+    echo "{\"tool\":\"overseer\", \"output\":\"$OVOUT\"}," >> $REPORT_FILE
+else
+    echo "{\"tool\":\"overseer\", \"error\":\"not found\"}," >> $REPORT_FILE
+fi
+
+# Step 5: Run our survival bridge (the one we wrote, pure JSON)
+if [ -f ~/Canon/survival.py ]; then
+    SROUT=$(python3 ~/Canon/survival.py 2>&1 | tr '\n' ' ')
+    echo "{\"tool\":\"canon_survival\", \"output\":\"$SROUT\"}" >> $REPORT_FILE
+else
+    echo "{\"tool\":\"canon_survival\", \"error\":\"not found\"}" >> $REPORT_FILE
+fi
+
+# Close JSON array
+echo "]}" >> $REPORT_FILE
+
+# Print the report
+cat $REPORT_FILE

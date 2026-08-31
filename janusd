@@ -1,0 +1,133 @@
+#!/usr/bin/env python3
+import os
+import sys
+import time
+import json
+import socket
+import urllib.request
+
+FIFO_PATH = os.path.expanduser("~/.janus_stream.fifo")
+SOCKET_PATH = os.path.expanduser("~/.modmind/bus.sock")
+SCHEMA_PATH = os.path.expanduser("~/.modmind/schemas/intent.json")
+API_KEY = os.getenv("OPENROUTER_API_KEY", "")
+
+REQUIRED_KEYS = ["action", "staged_cmd", "risk_level"]
+VALID_RISKS = ["low", "medium", "high"]
+
+def emit_modmind_event(event_type, payload):
+    """Sends a structured state payload to the ModMind socket if active."""
+    if not os.path.exists(SOCKET_PATH):
+        return
+    try:
+        client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        client.connect(SOCKET_PATH)
+        msg = json.dumps({"type": event_type, "timestamp": time.time(), "data": payload})
+        client.sendall(msg.encode('utf-8'))
+        client.close()
+    except Exception:
+        pass
+
+def validate_schema(data):
+    """Zero-dependency schema enforcement check."""
+    if not isinstance(data, dict):
+        return False, "Payload must be a JSON object."
+    for key in REQUIRED_KEYS:
+        if key not in data:
+            return False, f"Missing required key: {key}"
+    if data["risk_level"] not in VALID_RISKS:
+        return False, f"Invalid risk_level: {data['risk_level']}"
+    if not isinstance(data["staged_cmd"], str) or not data["staged_cmd"].strip():
+        return False, "staged_cmd must be a non-empty string."
+    return True, "Valid"
+
+def process_intent(history_buffer, retry_count=0):
+    if not API_KEY or retry_count > 2:
+        return
+
+    url = "https://openrouter.ai/api/v1/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {API_KEY}",
+        "Content-Type": "application/json",
+        "X-Title": "ModMind Janus Router"
+    }
+
+    system_prompt = f"""
+    You are Janus, a strict Task Router for the ModMind architecture.
+    You MUST respond with a raw JSON object matching this specification:
+    - "action": string (short summary)
+    - "staged_cmd": string (executable bash command)
+    - "risk_level": "low" | "medium" | "high"
+    - "target_file": string or null
+
+    DO NOT include markdown formatting or extra commentary.
+    """
+
+    user_prompt = f"Terminal History:\n{json.dumps(history_buffer, indent=2)}"
+
+    payload = {
+        "model": "stealth/ox-alpha",
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt}
+        ],
+        "response_format": {"type": "json_object"}
+    }
+
+    try:
+        req = urllib.request.Request(url, data=json.dumps(payload).encode('utf-8'), headers=headers, method='POST')
+        with urllib.request.urlopen(req, timeout=6) as resp:
+            res_data = json.loads(resp.read().decode('utf-8'))
+            raw_content = res_data["choices"][0]["message"]["content"].strip()
+            
+            # Clean possible markdown wrapping
+            if raw_content.startswith("```"):
+                raw_content = raw_content.split("\n", 1)[-1].rsplit("\n", 1)[0].replace("json\n", "")
+
+            intent = json.loads(raw_content)
+            
+            # HARD SCHEMA GATEWAY
+            is_valid, err_msg = validate_schema(intent)
+            if not is_valid:
+                print(f"[Janus Schema Error]: {err_msg}. Retrying...", file=sys.stderr)
+                # Self-healing loop: retry prompt
+                process_intent(history_buffer, retry_count + 1)
+                return
+
+            # Broadcast validated event to ModMind socket
+            emit_modmind_event("INTENT_STAGED", intent)
+            
+            # Write verified command staging file
+            with open(os.path.expanduser("~/.janus_staged.sh"), "w") as f:
+                f.write(f"# Janus Verified Command [{intent['risk_level'].upper()} RISK]\n")
+                f.write(f"# Goal: {intent['action']}\n")
+                f.write(f"{intent['staged_cmd']}\n")
+                
+    except Exception as e:
+        pass
+
+def main():
+    buffer = []
+    print("[Janus Task Router] Active with Schema Gateways...", file=sys.stderr)
+    
+    if not os.path.exists(FIFO_PATH): os.mkfifo(FIFO_PATH)
+    
+    while True:
+        try:
+            with open(FIFO_PATH, "r") as fifo:
+                for line in fifo:
+                    if line.strip():
+                        try:
+                            payload = json.loads(line)
+                            buffer.append(payload)
+                            if len(buffer) > 5:
+                                buffer.pop(0)
+                            
+                            emit_modmind_event("TERMINAL_EXEC", payload)
+                            process_intent(buffer)
+                        except json.JSONDecodeError:
+                            continue
+        except Exception:
+            time.sleep(1)
+
+if __name__ == "__main__":
+    main()

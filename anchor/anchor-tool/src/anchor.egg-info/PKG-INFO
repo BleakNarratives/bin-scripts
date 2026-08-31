@@ -1,0 +1,27 @@
+Metadata-Version: 2.4
+Name: anchor
+Version: 0.1.0
+Summary: A professional, standalone CLI for Puter-powered toolchains
+Author-email: Anchor User <user@example.com>
+Requires-Python: >=3.11
+Description-Content-Type: text/markdown
+Requires-Dist: click>=8.0.0
+Requires-Dist: rich>=10.0.0
+Requires-Dist: puter>=0.0.13
+Requires-Dist: tomli>=2.0.0
+
+# Anchor CLI
+
+This is a production-grade, standalone CLI tool for Puter-powered workflows.
+It is built to be independent, modular, and performant.
+
+## Installation
+```bash
+pip install -e .
+```
+
+## Usage
+```bash
+anchor chat "your prompt"
+anchor models
+```

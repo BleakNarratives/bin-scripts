@@ -1,0 +1,12 @@
+README.md
+pyproject.toml
+src/anchor/__init__.py
+src/anchor/cli.py
+src/anchor/config.py
+src/anchor/engine.py
+src/anchor.egg-info/PKG-INFO
+src/anchor.egg-info/SOURCES.txt
+src/anchor.egg-info/dependency_links.txt
+src/anchor.egg-info/entry_points.txt
+src/anchor.egg-info/requires.txt
+src/anchor.egg-info/top_level.txt

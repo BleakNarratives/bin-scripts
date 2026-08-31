@@ -1,0 +1,75 @@
+#!/bin/bash
+# ORCHESTRATE - Payment Engine + Thoth/Hermes integration + Easter egg
+# Usage: orchestrate {start|status|sprint|egg}
+
+PAYMENT_ENGINE=~/payment_system/main.py
+THOTH_DIR=~/RootBase/thoth_orchestrator
+HERMES_DIR=~/RootBase/hermes_agent  # guess, we'll check
+LOG=~/orchestrate.log
+
+start() {
+    ~/bin/master_control.sh start
+    # Check for Thoth
+    if [ -d "$THOTH_DIR" ]; then
+        echo "Thoth orchestrator found." >> $LOG
+        # attempt to start Thoth if it has a main script
+        if [ -f "$THOTH_DIR/load_env_bridge.py" ]; then
+            nohup python3 "$THOTH_DIR/load_env_bridge.py" --daemon >> $LOG 2>&1 &
+            echo "Thoth bridge started." >> $LOG
+        fi
+    else
+        echo "Thoth not found." >> $LOG
+    fi
+    # Check for Hermes (look for anything with 'hermes' in RootBase or elsewhere)
+    HERMES_PATH=$(find ~ -maxdepth 4 -name "*hermes*" -type f -executable 2>/dev/null | head -1)
+    if [ -n "$HERMES_PATH" ]; then
+        echo "Hermes agent found at $HERMES_PATH" >> $LOG
+        nohup "$HERMES_PATH" --daemon >> $LOG 2>&1 &
+        echo "Hermes started." >> $LOG
+    else
+        echo "Hermes not found." >> $LOG
+    fi
+    echo "Orchestration started at $(date)" >> $LOG
+}
+
+status() {
+    ~/bin/master_control.sh status
+    echo "Thoth: $([ -d "$THOTH_DIR" ] && echo 'present' || echo 'missing')"
+    echo "Hermes: $([ -n "$(find ~ -maxdepth 4 -name '*hermes*' -type f -executable 2>/dev/null | head -1)" ] && echo 'present' || echo 'missing')"
+}
+
+sprint() {
+    # Simulate a sprint loop: call Thoth if available, else use local stub
+    echo "Sprint $1 started at $(date)" >> $LOG
+    # If Thoth has an API, call it; otherwise mock
+    if [ -f "$THOTH_DIR/load_env_bridge.py" ]; then
+        python3 "$THOTH_DIR/load_env_bridge.py" --task "$1" 2>/dev/null || echo "Thoth task failed, using stub" >> $LOG
+    else
+        echo "Mock sprint $1 complete" >> $LOG
+    fi
+    # Always record a payment for the sprint
+    ~/bin/master_control.sh charge 99 "sprint_$1" 2>/dev/null
+    echo "Sprint $1 done."
+}
+
+egg() {
+    cat << 'EGG'
+  _____          _    _                     _     
+ |  ___|        | |  | |                   | |    
+ | |__ _ __  ___| |_ | | __ _  __ _  ___  | |_   
+ |  __| '_ \/ __| __|| |/ _` |/ _` |/ _ \ | __|  
+ | |__| | | \__ \ |_ | | (_| | (_| |  __/ | |_   
+ \____/_| |_|___/\__||_|\__,_|\__, |\___|  \__|  
+                               __/ |              
+                              |___/               
+EGG
+    echo "You found the Easter egg! Now go charge something."
+}
+
+case "$1" in
+    start)   start ;;
+    status)  status ;;
+    sprint)  sprint "$2" ;;
+    egg)     egg ;;
+    *)       echo "Usage: orchestrate {start|status|sprint [task]|egg}"; exit 1 ;;
+esac

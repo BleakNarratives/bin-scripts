@@ -1,0 +1,72 @@
+#!/usr/bin/env bash
+# vault-env — source the concierge vault and export API keys as environment variables
+#
+# FIXED 2026-08-31: the python block was wrapped in bash DOUBLE quotes while the
+# pool line contained a literal `",".join(pool)` with an inner double-quote. Bash
+# treated that inner `"` as closing the outer string, mangled the script, and the
+# whole `$()` capture silently returned nothing -> "Loaded: none" even though the
+# vault had real keys. Now the block is single-quoted so inner `"` are safe.
+VAULT_JSON="$HOME/.concierge/vault.json"
+if [ ! -f "$VAULT_JSON" ]; then
+  echo "[vault] No vault at $VAULT_JSON -- run concierge first" >&2
+  if [ -f "$HOME/The-Werkz/.env.vault" ]; then
+    set -a; . "$HOME/The-Werkz/.env.vault"; set +a
+    echo "[vault] Loaded from .env.vault fallback" >&2
+  fi
+  return 0 2>/dev/null || exit 0
+fi
+
+_VJ="$VAULT_JSON"
+_VAULT_EXPORTS=$(python3 -c '
+import json
+v = json.load(open("'"$_VJ"'"))
+keys = v.get("keys", {})
+mapping = {
+    "openrouter": "OPENROUTER_API_KEY",
+    "groq": "GROQ_API_KEY",
+    "gemini": "GEMINI_API_KEY",
+    "cerebras": "CEREBRAS_API_KEY",
+    "anthropic": "ANTHROPIC_API_KEY",
+    "zenmux": "ZENMUX_API_KEY",
+    "orcarouter": "ORCAROUTER_API_KEY",
+    "bazaar": "BAZAAR_API_KEY",
+    "openai": "OPENAI_API_KEY",
+    "jules": "JULES_API_KEY",
+    "swarms": "SWARMS_API_KEY",
+    "mistral": "MISTRAL_API_KEY",
+    "vibe": "VIBE_API_KEY",
+}
+loaded = []
+for provider, envvar in mapping.items():
+    k = keys.get(provider, {}).get("key", "")
+    if k and "PLACEHOLDER" not in k and k != "sk-test_key_placeholder":
+        print("export %s=%r" % (envvar, k))
+        loaded.append(envvar.replace("_API_KEY", ""))
+pool = v.get("keys_by_provider", {}).get("openrouter", [])
+if pool:
+    print("export OPENROUTER_API_KEY_POOL=%r" % ",".join(pool))
+# infra bucket: non-provider secrets (DB/S3/SMTP/payment) retired from naked .env
+infra = v.get("infra", {})
+for section, kv in infra.items():
+    for k, val in kv.items():
+        if not isinstance(val, str):
+            continue
+        print("export %s=%r" % (k, val))
+        if k not in loaded:
+            loaded.append(k)
+print("export _VAULT_LOADED_LIST=\"%s\"" % " ".join(loaded))
+' 2>/dev/null)
+
+eval "$_VAULT_EXPORTS"
+
+if [ -n "${ZENMUX_API_KEY:-}" ]; then
+  export ZAI_API_KEY="$ZENMUX_API_KEY"
+fi
+
+echo "[vault] Loaded: ${_VAULT_LOADED_LIST:-none}" >&2
+
+if [ "${BASH_SOURCE[0]:-}" != "${0}" ]; then
+  return 0 2>/dev/null || true
+elif [ $# -gt 0 ]; then
+  exec "$@"
+fi

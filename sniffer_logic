@@ -1,0 +1,2 @@
+#!/bin/bash
+python3 ~/.grimoire/sparks/spark_integrity.py --single-check "$1" 2>/dev/null
