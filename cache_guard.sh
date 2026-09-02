@@ -1,28 +1,39 @@
 #!/bin/bash
 # cache_guard.sh — keep regenerable caches from eating the disk
 #
-# Checks each target dir's size; if it exceeds the limit, purges it.
-# Designed for build caches that regrow (cargo target dirs etc.) —
-# deletion is safe, next build just recompiles.
+# Two layers of defense:
+#   1. Per-dir purge: any watch-list dir over the per-dir limit gets purged.
+#   2. GLOBAL DISK FLOOR: if free space on / drops below DISK_FLOOR_GB,
+#      watch-list dirs are purged largest-first regardless of per-dir
+#      limits until the floor is restored. This is the 2026-09-01 lesson —
+#      yarn (5.1G) + berd target (6.9G) + buzz target (5.4G) grew past the
+#      old watch list and pushed the disk to 99% with only 1.3G free.
+#
+# Designed for build caches that regrow — deletion is safe, next build
+# just recompiles. Never touches source, git history, node_modules, or data.
 #
 # Usage: cache_guard.sh [limit_gb] [dir...]
 #   limit_gb   threshold per dir, default 3 (GB)
-#   dirs       default watch list:
-#                ~/.cache/berd-dev            cargo build artifacts
-#                ~/.local/share/pnpm/store    pnpm package store
-#                ~/.cargo/registry            crate downloads
+#   dirs       default watch list (see below)
+#   --memory   purge everything on the watch list regardless of size
+#              (used when MemGuard signals memory pressure, not disk)
+#
+# Env:
+#   CACHE_GUARD_DISK_FLOOR_GB   free-space floor, default 5 (GB)
 #
 # Wired into bin/round.sh so it runs every 10-minute round.
 
 LIMIT_GB=${1:-3}
 shift || true
 FORCE=0
-# --memory mode: purge everything on the watch list regardless of size
-# (used when MemGuard signals memory pressure, not disk pressure).
 [ "$LIMIT_GB" = "--memory" ] && { FORCE=1; LIMIT_GB=3; }
 DIRS=("$@")
 [ ${#DIRS[@]} -eq 0 ] && DIRS=(
+    "$HOME/.cache/yarn"
     "$HOME/.cache/berd-dev"
+    "$HOME/.cache/uv"
+    "$HOME/berd/src-tauri/target"
+    "$HOME/buzz/target"
     "$HOME/.local/share/pnpm/store"
     "$HOME/.cargo/registry"
     "$HOME/.npm/_cacache"
@@ -31,15 +42,53 @@ DIRS=("$@")
 
 LOG=${CACHE_GUARD_LOG:-$HOME/rounds.log}
 LIMIT_MB=$((LIMIT_GB * 1024))
+DISK_FLOOR_GB=${CACHE_GUARD_DISK_FLOOR_GB:-5}
 
+log() { echo "$(date -Iseconds), cache_guard, $*" >> "$LOG"; }
+
+purge_dir() {
+    local d="$1"
+    log "$d at ${2}MB — purging"
+    chmod -R u+w "$d" 2>/dev/null   # some caches ship read-only stubs
+    rm -rf "$d" 2>/dev/null
+    log "PURGED $d"
+}
+
+free_gb() { df -BG / | awk 'NR==2 {print $4}' | tr -d 'G'; }
+
+dir_mb() { du -sm "$1" 2>/dev/null | cut -f1; }
+
+# --- layer 1: per-dir limits (or --memory force) ---
 for d in "${DIRS[@]}"; do
     [ -d "$d" ] || continue
-    mb=$(du -sm "$d" 2>/dev/null | cut -f1)
+    mb=$(dir_mb "$d")
     [ -z "$mb" ] && continue
     if [ "$FORCE" = 1 ] || [ "$mb" -ge "$LIMIT_MB" ]; then
-        echo "$(date -Iseconds), cache_guard, $d at ${mb}MB >= ${LIMIT_MB}MB limit — purging" >> "$LOG"
-        chmod -R u+w "$d" 2>/dev/null   # some caches ship read-only stubs
-        rm -rf "$d"
-        echo "$(date -Iseconds), cache_guard, PURGED $d" >> "$LOG"
+        purge_dir "$d" "$mb"
     fi
 done
+
+# --- layer 2: global disk floor — purge largest-first until restored ---
+avail=$(free_gb)
+if [ "$avail" -lt "$DISK_FLOOR_GB" ]; then
+    log "DISK FLOOR BREACH: ${avail}G free < ${DISK_FLOOR_GB}G floor — emergency purge largest-first"
+    # Build "size<TAB>path" pairs for existing dirs, sort numerically desc.
+    # (Tab-separated so paths with spaces survive the sort; NUL not needed —
+    # watch-list paths never contain tabs/newlines.)
+    pairs=()
+    for d in "${DIRS[@]}"; do
+        [ -d "$d" ] || continue
+        mb=$(dir_mb "$d")
+        [ -z "$mb" ] && continue
+        pairs+=("$mb"$'\t'"$d")
+    done
+    while IFS=$'\t' read -r mb d; do
+        avail=$(free_gb)
+        [ "$avail" -ge "$DISK_FLOOR_GB" ] && break
+        [ -z "$d" ] && continue
+        [ "$mb" -lt 100 ] && continue   # skip noise under 100MB
+        purge_dir "$d" "$mb"
+    done < <(printf '%s\n' "${pairs[@]}" | sort -rn)
+    avail=$(free_gb)
+    log "disk floor purge complete: ${avail}G free"
+fi
