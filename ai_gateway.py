@@ -84,7 +84,11 @@ AUTO_CHAIN = ("deepinfra", "sambanova", "openrouter", "mistral", "gemini",
 
 FALLBACK_MODEL = {
     "groq": "openai/gpt-oss-120b",
-    "cerebras": "llama-3.3-70b",
+    # Cerebras serves exactly three models (verified 2026-09-15 via
+    # /v1/models): gpt-oss-120b, qwen-3.8-27b, gemma-4-31b. The old
+    # "llama-3.3-70b" id 404s, which made four perfectly valid keys look
+    # revoked.
+    "cerebras": "gpt-oss-120b",
     # Verified live 2026-09-15: z-ai/glm-5.2:free answers 404 "Provider
     # returned error" and google/gemma-4-31b-it:free is temporarily rate
     # limited. This one returned 200.
@@ -102,6 +106,15 @@ FALLBACK_MODEL = {
     "deepinfra": "meta-llama/Meta-Llama-3.3-70B-Instruct",
     "sambanova": "Meta-Llama-3.3-70B-Instruct",
 }
+
+# Cloudflare sits in front of several providers (Groq, Cerebras) and bans
+# Python-urllib's default User-Agent with HTTP 403 / "error code: 1010"
+# BEFORE authentication is evaluated. Without this header every key looks
+# revoked, the auth-quarantine below marks the pool dead, and rotation appears
+# broken while it is doing exactly what it was told. Verified 2026-09-15: the
+# same key returns 403 with the default UA and 401 "Invalid API Key" with this
+# one.
+USER_AGENT = "Mozilla/5.0 (compatible; ai_gateway/1.0; +http://127.0.0.1)"
 
 COOLDOWN_429 = 30.0      # per-key cooldown after a rate limit
 QUARANTINE_401 = 3600.0  # dead auth: park the key for an hour
@@ -255,6 +268,7 @@ def call_upstream(provider: str, model: str, body: dict, timeout: int = 60):
         req = urllib.request.Request(url, data=data, method="POST")
         req.add_header("Content-Type", "application/json")
         req.add_header("Authorization", f"Bearer {key}")
+        req.add_header("User-Agent", USER_AGENT)
         if provider == "openrouter":
             req.add_header("HTTP-Referer", "http://localhost")
             req.add_header("X-Title", "ai_gateway")
@@ -381,6 +395,7 @@ def probe_provider(provider: str) -> dict:
     req = urllib.request.Request(url, data=payload, method="POST")
     req.add_header("Content-Type", "application/json")
     req.add_header("Authorization", f"Bearer {pool[0]}")
+    req.add_header("User-Agent", USER_AGENT)
     try:
         with urllib.request.urlopen(req, timeout=30) as resp:
             return {"provider": provider, "keys": len(pool), "state": "live",
