@@ -21,6 +21,7 @@ _VAULT_EXPORTS=$(python3 -c '
 import json
 v = json.load(open("'"$_VJ"'"))
 keys = v.get("keys", {})
+kbp = v.get("keys_by_provider", {})
 mapping = {
     "openrouter": "OPENROUTER_API_KEY",
     "groq": "GROQ_API_KEY",
@@ -35,16 +36,39 @@ mapping = {
     "swarms": "SWARMS_API_KEY",
     "mistral": "MISTRAL_API_KEY",
     "vibe": "VIBE_API_KEY",
+    "sageox": "SAGEOX_API_KEY",
+    "deepinfra": "DEEPINFRA_API_KEY",
+    "sambanova": "SAMBANOVA_API_KEY",
 }
 loaded = []
+def _clean(k):
+    return k and "PLACEHOLDER" not in k and k != "sk-test_key_placeholder"
 for provider, envvar in mapping.items():
-    k = keys.get(provider, {}).get("key", "")
-    if k and "PLACEHOLDER" not in k and k != "sk-test_key_placeholder":
+    # 1) Prefer the pool: if keys_by_provider has a list, use it.
+    #    The *_API_KEY var gets the FIRST key (for single-key consumers),
+    #    and *_API_KEY_POOL gets the comma-joined full pool (for router.py
+    #    rotation logic that splits on commas).
+    pool = kbp.get(provider, [])
+    if isinstance(pool, list):
+        pool = [k for k in pool if _clean(k)]
+    else:
+        pool = []
+    if pool:
+        # *_API_KEY gets the FIRST key (single-key consumers like CLIs send
+        # it as a Bearer token — a comma-joined string would be invalid).
+        # *_API_KEY_POOL gets the comma-joined full pool for consumers that
+        # implement rotation (router.py reads GROQ_API_KEY_POOL).
+        print("export %s=%r" % (envvar, pool[0]))
+        print("export %s_POOL=%r" % (envvar, ",".join(pool)))
+        loaded.append(envvar.replace("_API_KEY", ""))
+        continue
+    # 2) Fall back to the single-key entry (keys.<provider>.key)
+    k = keys.get(provider, {})
+    if isinstance(k, dict):
+        k = k.get("key", "")
+    if _clean(k):
         print("export %s=%r" % (envvar, k))
         loaded.append(envvar.replace("_API_KEY", ""))
-pool = v.get("keys_by_provider", {}).get("openrouter", [])
-if pool:
-    print("export OPENROUTER_API_KEY_POOL=%r" % ",".join(pool))
 # infra bucket: non-provider secrets (DB/S3/SMTP/payment) retired from naked .env
 infra = v.get("infra", {})
 for section, kv in infra.items():
@@ -61,6 +85,13 @@ eval "$_VAULT_EXPORTS"
 
 if [ -n "${ZENMUX_API_KEY:-}" ]; then
   export ZAI_API_KEY="$ZENMUX_API_KEY"
+fi
+
+# SageOx's native CLI reads SAGEOX_TOKEN (not SAGEOX_API_KEY).
+# Keep the descriptive provider variable too, but expose the PAT alias only
+# inside this vault-loaded process.
+if [ -n "${SAGEOX_API_KEY:-}" ]; then
+  export SAGEOX_TOKEN="$SAGEOX_API_KEY"
 fi
 
 echo "[vault] Loaded: ${_VAULT_LOADED_LIST:-none}" >&2

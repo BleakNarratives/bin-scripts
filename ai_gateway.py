@@ -71,10 +71,16 @@ PROVIDERS = {
     "mistral": "https://api.mistral.ai/v1/chat/completions",
     "openai": "https://api.openai.com/v1/chat/completions",
     "gemini": "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
+    # Cheap pay-as-you-go OpenAI-compatible paths, so one paid key ends the
+    # free-tier rate-limit problem without any further wiring.
+    "deepinfra": "https://api.deepinfra.com/v1/openai/chat/completions",
+    "sambanova": "https://api.sambanova.ai/v1/chat/completions",
 }
 
-# Order "auto" walks. Cheapest/free tiers first.
-AUTO_CHAIN = ("groq", "cerebras", "openrouter", "mistral", "gemini", "openai")
+# Order "auto" walks. Paid/always-available providers first; the free-tier
+# pools last, since those are the ones that rate-limit or come back revoked.
+AUTO_CHAIN = ("deepinfra", "sambanova", "openrouter", "mistral", "gemini",
+              "openai", "groq", "cerebras")
 
 FALLBACK_MODEL = {
     "groq": "openai/gpt-oss-120b",
@@ -88,6 +94,10 @@ FALLBACK_MODEL = {
     # ~2.7s and tracks whatever Google currently serves, so prefer it.
     "gemini": "gemini-flash-latest",
     "openai": "gpt-4o-mini",
+    # Overridable per request (ai --model deepinfra::<id>). Verify the id once
+    # the key exists — a wrong id 404s and the chain falls through.
+    "deepinfra": "meta-llama/Meta-Llama-3.3-70B-Instruct",
+    "sambanova": "Meta-Llama-3.3-70B-Instruct",
 }
 
 COOLDOWN_429 = 30.0      # per-key cooldown after a rate limit
