@@ -14,35 +14,39 @@ import sys, os, json, subprocess, time
 sys.path.insert(0, os.path.expanduser("~/bin/anchor"))
 import memory, tools, models as mdl, patcher
 
-def call_puter(prompt, model=None):
-    model = model or mdl.DEFAULT_MODEL
-    r = subprocess.run(
-        ["node", os.path.expanduser("~/bin/puter_bridge.js"), prompt],
-        capture_output=True, text=True
-    )
-    out = r.stdout.strip()
-    # extract just the text content from the response
-    try:
-        data = json.loads(out)
-        return data.get("message",{}).get("content", out)
-    except:
-        return out
+def call_model(prompt, model=None):
+    """Route the request through the shared client (bin/ai_lib.py -> the
+    rotating gateway).
+
+    Puter is retired: ~/.puter_token does not exist, so the old node bridge
+    could only ever print "[puter_bridge] No token found" and exit 1. Every
+    Anchor request was therefore dead at the transport layer, not just slow.
+    """
+    sys.path.insert(0, os.path.expanduser("~/bin"))
+    import ai_lib
+    return ai_lib.ask(prompt, model=model or None)
 
 def build_context():
-    try:
-        from memory import get_state
-        project = get_state("project") or {}
-        user    = get_state("user") or {}
-    except:
-        project, user = {}, {}
+    # Project/user context comes from the persistent store, so `anchor
+    # --remember project '{"name": "x"}'` survives across runs.
+    def _load_fact(key):
+        raw = memory.recall(key)
+        if not raw:
+            return {}
+        try:
+            return json.loads(raw)
+        except Exception:
+            return {"value": raw}
+
+    project, user = _load_fact("project"), _load_fact("user")
 
     history = memory.get_recent(6)
     ctx  = f"## Who you're helping\n{json.dumps(user, indent=2)}\n\n"
     ctx += f"## Project state\n{json.dumps(project, indent=2)}\n\n"
     if history:
         ctx += "## Recent history\n"
-        for role, content in history:
-            ctx += f"[{role}]: {content[:500]}\n"
+        for msg in history:
+            ctx += f"[{msg.get('role', '?')}]: {str(msg.get('content', ''))[:500]}\n"
     return ctx
 
 def read_stdin():
@@ -53,7 +57,29 @@ def read_stdin():
 def main():
     args = sys.argv[1:]
 
-    # handle flags that don't need puter
+    # ── persistent state and search (no model call) ──────────────────────────
+    if args and args[0] == "--remember":
+        memory.remember(args[1], " ".join(args[2:]))
+        print(f"[anchor] remembered {args[1]}")
+        return
+    if args and args[0] == "--recall":
+        value = memory.recall(args[1])
+        print(value if value is not None else f"[anchor] nothing stored for {args[1]!r}")
+        return
+    if args and args[0] == "--facts":
+        import store
+        for fact in store.all_facts():
+            print(f"{fact['key']} = {fact['value']}")
+        return
+    if args and args[0] == "--stats":
+        print(memory.stats())
+        return
+    if args and args[0] == "--web":
+        import web_search
+        print(web_search.format_results(web_search.search(" ".join(args[1:]))))
+        return
+
+    # handle flags that don't need a model
     if not args and sys.stdin.isatty():
         print("Usage: anchor <prompt>")
         print("       anchor --feed file1.py file2.py 'prompt'")
@@ -123,7 +149,7 @@ def main():
 
     memory.push("user", (prompt or "[piped input]")[:300])
     t0       = time.time()
-    response = call_puter(full, model)
+    response = call_model(full, model)
     latency  = int((time.time()-t0)*1000)
 
     success = bool(response) and not response.startswith("[puter_bridge]")

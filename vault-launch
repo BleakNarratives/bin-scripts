@@ -1,0 +1,95 @@
+#!/usr/bin/env bash
+# vault-launch — execute a named CLI with vault credentials in the child only.
+# Explicit mode: vault-launch <command> [args...]
+# Symlink mode: a command symlink (codex, aider, vibe, ox, sageox, gemini)
+# resolves its corresponding -real binary and executes it.
+set -euo pipefail
+
+VAULT_ENV="${HOME}/bin/vault-env"
+if [[ ! -r "$VAULT_ENV" ]]; then
+  echo "[vault-launch] missing readable vault loader: $VAULT_ENV" >&2
+  exit 3
+fi
+# shellcheck disable=SC1090
+. "$VAULT_ENV" >/dev/null 2>&1 || true
+
+# Rotation is only real while the gateway is up. Best-effort and non-fatal:
+# if it cannot start, the wrapped CLI runs exactly as it did before.
+if [[ "${AI_GATEWAY_NO_AUTOSTART:-0}" != 1 && -x "$HOME/bin/gateway-ensure" ]]; then
+  "$HOME/bin/gateway-ensure" >/dev/null 2>&1 || true
+fi
+
+SNAPSHOT_TOOL="${HOME}/RootBase/agent_asset_snapshot.py"
+snapshot_assets() {
+  # Asset preservation is intentionally best-effort and disabled for doctor,
+  # version, and help probes so diagnostics remain fast and side-effect-free.
+  [[ "${VAULT_LAUNCH_NO_SNAPSHOT:-0}" == 1 ]] && return 0
+  [[ -f "$SNAPSHOT_TOOL" ]] || return 0
+  python3 "$SNAPSHOT_TOOL" --quiet >/dev/null 2>&1 || \
+    echo "[vault-launch] warning: agent asset snapshot failed" >&2
+}
+
+resolve_command() {
+  local target="$1" self_real="$2" candidate real_path directory
+  local -a directories=("${HOME}/.local/bin" "${HOME}/.npm-global/bin" "${HOME}/RootBase/bin" "/usr/local/bin" "/usr/bin")
+
+  # Prefer an explicit sibling or known real binary.
+  for directory in "${HOME}/bin" "${HOME}/.local/bin" "${HOME}/.npm-global/bin" "${HOME}/RootBase/bin"; do
+    candidate="$directory/${target}-real"
+    if [[ -x "$candidate" ]]; then
+      real_path="$(readlink -f "$candidate" 2>/dev/null || true)"
+      [[ -n "$real_path" && "$real_path" != "$self_real" ]] && { printf '%s\n' "$candidate"; return 0; }
+    fi
+  done
+
+  # Then search PATH, excluding this wrapper and duplicate directory entries.
+  local old_ifs="$IFS"
+  IFS=:
+  for directory in ${PATH:-}; do
+    [[ -n "$directory" ]] || continue
+    candidate="$directory/$target"
+    [[ -x "$candidate" ]] || continue
+    real_path="$(readlink -f "$candidate" 2>/dev/null || true)"
+    if [[ -n "$real_path" && "$real_path" != "$self_real" && "$real_path" != "$(readlink -f "$0" 2>/dev/null || true)" ]]; then
+      IFS="$old_ifs"
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done
+  IFS="$old_ifs"
+
+  # Last fallback checks conventional locations for a non-wrapper target.
+  for directory in "${directories[@]}"; do
+    candidate="$directory/$target"
+    [[ -x "$candidate" ]] || continue
+    real_path="$(readlink -f "$candidate" 2>/dev/null || true)"
+    [[ -n "$real_path" && "$real_path" != "$self_real" ]] && { printf '%s\n' "$candidate"; return 0; }
+  done
+  return 1
+}
+
+run_target() {
+  local target="$1"
+  shift
+  local wrapper_real="$(readlink -f "$0" 2>/dev/null || printf '%s' "$0")"
+  local real_bin
+  if ! real_bin="$(resolve_command "$target" "$wrapper_real")"; then
+    echo "[vault-launch] cannot locate real '$target' binary" >&2
+    echo "[vault-launch] expected '${HOME}/bin/$target-real', '${HOME}/.local/bin/$target-real', or a non-wrapper '$target' on PATH" >&2
+    exit 127
+  fi
+  if [[ "$(readlink -f "$real_bin" 2>/dev/null || true)" == "$wrapper_real" ]]; then
+    echo "[vault-launch] refusing recursive resolution for '$target'" >&2
+    exit 126
+  fi
+  snapshot_assets
+  exec "$real_bin" "$@"
+}
+
+self_name="$(basename "$0")"
+if [[ "$self_name" == "vault-launch" ]]; then
+  [[ $# -gt 0 ]] || { echo "Usage: vault-launch <command> [args...]" >&2; exit 2; }
+  run_target "$@"
+else
+  run_target "$self_name" "$@"
+fi

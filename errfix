@@ -1,0 +1,266 @@
+#!/usr/bin/env python3
+# [DNA_TAG]
+# ORIGIN: Crostini-Chromebook
+# PILLAR: armory
+# DEPS: ai_lib (stdlib)
+# ROLE: Catch a command's traceback, diagnose it, optionally apply the fix
+# AUTHOR: Bleak
+# SESSION: 2026-09-15
+# TIER: 3
+# [/DNA_TAG]
+
+"""errfix — stop reading tracebacks by hand.
+
+  errfix python thing.py        run it; on failure, diagnose inline
+  errfix --apply python thing.py   same, but write the fix when it is unambiguous
+  errfix --file crash.log       diagnose a traceback you already have
+  cat crash.log | errfix --stdin
+
+The command's own output is always printed unchanged first, so wrapping a
+command never hides what it did. Only the diagnosis is added.
+
+--apply is deliberately strict: it rewrites a file ONLY when the model's
+suggested OLD block matches that file exactly once, and it writes a .bak first.
+Anything ambiguous is printed, never applied.
+"""
+
+from __future__ import annotations
+
+import argparse
+import difflib
+import json
+import re
+import shlex
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import ai_lib  # noqa: E402
+
+MAX_CONTEXT_LINES = 12
+ERROR_MARKERS = (
+    "Traceback (most recent call last):",
+    "SyntaxError:",
+    "IndentationError:",
+    "TabError:",
+    "ModuleNotFoundError:",
+    "ImportError:",
+    "NameError:",
+    "TypeError:",
+    "ValueError:",
+    "KeyError:",
+    "AttributeError:",
+    "IndexError:",
+    "FileNotFoundError:",
+    "PermissionError:",
+    "ZeroDivisionError:",
+    "RecursionError:",
+    "AssertionError:",
+    "RuntimeError:",
+    "UnboundLocalError:",
+    "npm ERR!",
+    "ERESOLVE",
+    "command not found",
+    "syntax error near",
+    "Segmentation fault",
+)
+
+FILE_LINE_RE = re.compile(r'File "([^"]+)", line (\d+)')
+
+PROMPT = """A command failed. Fix it.
+
+Rules:
+- One-line root cause, then the fix. No preamble, no restating the traceback.
+- If you can pinpoint a code edit, emit EXACTLY this block (verbatim old text,
+  copied from the file context, matched character-for-character):
+
+CAUSE: <one line>
+---FILE---
+<absolute path>
+---OLD---
+<exact existing block>
+---NEW---
+<exact replacement block>
+---END---
+
+- If the fix is a command or config change, emit:
+CAUSE: <one line>
+RUN: <shell command>
+
+If you are not sure, say so in one line. Never invent a file that was not shown.
+"""
+
+
+def looks_like_error(text: str) -> bool:
+    return any(marker in text for marker in ERROR_MARKERS)
+
+
+def extract_error(text: str) -> str:
+    """Return the failing block: last traceback, else the last error line."""
+    idx = text.rfind("Traceback (most recent call last):")
+    if idx != -1:
+        return text[idx:].strip()
+    lines = text.splitlines()
+    for line in reversed(lines):
+        if looks_like_error(line):
+            return "\n".join(lines[max(0, lines.index(line) - 2):]).strip()
+    return text.strip()[-4000:]
+
+
+def gather_context(error_text: str) -> str:
+    """Read the code around every file:line the traceback points at."""
+    chunks: list[str] = []
+    seen: set[tuple[str, int]] = set()
+    for path, line in FILE_LINE_RE.findall(error_text):
+        key = (path, int(line))
+        if key in seen:
+            continue
+        seen.add(key)
+        try:
+            target = Path(path)
+            source = target.read_text(errors="replace").splitlines()
+        except OSError:
+            continue
+        lineno = int(line)
+        start = max(0, lineno - MAX_CONTEXT_LINES)
+        end = min(len(source), lineno + MAX_CONTEXT_LINES)
+        numbered = "\n".join(
+            f"{n + 1:>5} | {source[n]}" for n in range(start, end))
+        chunks.append(f"### {path} (around line {lineno})\n{numbered}")
+    return "\n\n".join(chunks)
+
+
+def run_command(cmd: list[str]) -> tuple[int, str]:
+    proc = subprocess.run(cmd, capture_output=True, text=True)
+    combined = proc.stdout
+    if proc.stderr:
+        combined += ("\n" if combined else "") + proc.stderr
+    return proc.returncode, combined
+
+
+def parse_fix(reply: str) -> dict:
+    """Pull the strict block out of a model reply, if present."""
+    out: dict = {"cause": "", "file": None, "old": None, "new": None, "run": None}
+    cause = re.search(r"^\s*CAUSE:\s*(.+)$", reply, re.M)
+    if cause:
+        out["cause"] = cause.group(1).strip()
+    run = re.search(r"^\s*RUN:\s*(.+)$", reply, re.M)
+    if run:
+        out["run"] = run.group(1).strip()
+    block = re.search(
+        r"---FILE---\s*(.+?)\s*---OLD---\s*\n(.*?)\n---NEW---\s*\n(.*?)\n---END---",
+        reply, re.S)
+    if block:
+        out["file"] = block.group(1).strip()
+        out["old"] = block.group(2)
+        out["new"] = block.group(3)
+    return out
+
+
+def apply_fix(fix: dict) -> str:
+    """Apply only when the OLD block matches exactly once. Otherwise refuse."""
+    if not fix.get("file") or fix.get("old") is None or fix.get("new") is None:
+        return "not applied (no exact patch block)"
+    target = Path(fix["file"]).expanduser()
+    if not target.is_file():
+        return f"not applied (no such file: {target})"
+    original = target.read_text(errors="replace")
+    occurrences = original.count(fix["old"])
+    if occurrences == 0:
+        return "not applied (OLD block does not match the file)"
+    if occurrences > 1:
+        return f"not applied (OLD block matches {occurrences}x — ambiguous)"
+    backup = target.with_suffix(target.suffix + ".bak.errfix")
+    backup.write_text(original)
+    target.write_text(original.replace(fix["old"], fix["new"], 1))
+    diff = "\n".join(difflib.unified_diff(
+        original.splitlines(), target.read_text().splitlines(),
+        fromfile=str(target) + " (before)", tofile=str(target) + " (after)",
+        lineterm=""))
+    return f"applied to {target} (backup: {backup.name})\n{diff}"
+
+
+def diagnose(error_text: str, extra_context: str = "") -> str:
+    user = f"Command output:\n```\n{error_text}\n```"
+    if extra_context:
+        user += f"\n\nFile context:\n```\n{extra_context}\n```"
+    return ai_lib.ask(user, system=PROMPT)
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(prog="errfix", description=__doc__)
+    parser.add_argument("command", nargs=argparse.REMAINDER,
+                        help="command to run (everything after --)")
+    parser.add_argument("--apply", action="store_true",
+                        help="write the fix when the patch is unambiguous")
+    parser.add_argument("--file", help="diagnose a traceback already in a file")
+    parser.add_argument("--stdin", action="store_true",
+                        help="diagnose a traceback piped on stdin")
+    parser.add_argument("--json", action="store_true", help="machine-readable output")
+    args = parser.parse_args(argv)
+
+    command = [a for a in args.command if a != "--"]
+    output = ""
+    rc = 0
+
+    if args.file:
+        output = Path(args.file).expanduser().read_text(errors="replace")
+        print(output)
+    elif args.stdin or (not command and not sys.stdin.isatty()):
+        output = sys.stdin.read()
+    elif command:
+        started = time.time()
+        rc, output = run_command(command)
+        sys.stdout.write(output)
+        if not output.endswith("\n"):
+            sys.stdout.write("\n")
+        print(f"[errfix] {shlex.join(command)} -> exit {rc} "
+              f"({time.time() - started:.1f}s)", file=sys.stderr)
+    else:
+        parser.print_help(sys.stderr)
+        return 2
+
+    if not output.strip() or not looks_like_error(output):
+        if args.json:
+            print(json.dumps({"ok": True, "error": False, "exit": rc}))
+        else:
+            print("[errfix] no error detected — nothing to fix.")
+        return rc
+
+    error_text = extract_error(output)
+    context = gather_context(error_text)
+    try:
+        reply = diagnose(error_text, context)
+    except RuntimeError as exc:
+        print(f"[errfix] diagnosis unavailable: {exc}", file=sys.stderr)
+        return rc
+
+    fix = parse_fix(reply)
+    applied = ""
+
+    if args.apply:
+        if fix.get("run"):
+            proc = subprocess.run(fix["run"], shell=True, capture_output=True, text=True)
+            applied = f"ran: {fix['run']}\nexit {proc.returncode}\n{proc.stdout}{proc.stderr}"
+        elif fix.get("file"):
+            applied = apply_fix(fix)
+
+    if args.json:
+        print(json.dumps({"ok": True, "error": True, "exit": rc,
+                          "reply": reply, "applied": applied or None}))
+        return rc
+
+    print("\n" + "─" * 70)
+    print("errfix")
+    print("─" * 70)
+    print(reply)
+    if applied:
+        print("\n" + "─" * 70)
+        print(applied)
+    return rc
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

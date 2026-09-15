@@ -1,0 +1,45 @@
+#!/usr/bin/env bash
+# gateway-ensure — make sure the rotating AI gateway is listening on :7071.
+#
+# WHY: aider/vibe/ox and the errfix wrapper get key ROTATION only while
+# bin/ai_gateway.py is running. The systemd unit exists but is deliberately
+# NOT enabled, so this is the on-demand path: start it if it is not already up.
+#
+# WHY SYSTEMD FIRST: a plain `nohup ... &` started from a short-lived shell is
+# reaped when that shell tears down (verified: the process count went to 0).
+# systemd owns the process instead, so it stays up. The unit remains disabled,
+# so nothing starts at boot.
+#
+# SAFETY: idempotent, non-fatal, silent. Never blocks, never fails a caller —
+# if the gateway cannot start, the caller runs without rotation exactly as it
+# did before. Set AI_GATEWAY_NO_AUTOSTART=1 to opt out entirely.
+set -u
+[[ "${AI_GATEWAY_NO_AUTOSTART:-0}" == "1" ]] && exit 0
+
+PORT="${AI_GATEWAY_PORT:-7071}"
+GATEWAY="${HOME}/bin/ai_gateway.py"
+
+health() { curl -sf -m 2 "http://127.0.0.1:${PORT}/health" >/dev/null 2>&1; }
+
+health && exit 0
+
+# 1) Preferred: let systemd own it (survives the caller's shell).
+if command -v systemctl >/dev/null 2>&1; then
+  if systemctl --user start ai-gateway >/dev/null 2>&1; then
+    for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
+      health && exit 0
+      sleep 0.2
+    done
+  fi
+fi
+
+# 2) Fallback: detached child. Works for this shell's lifetime only.
+[[ -r "$GATEWAY" ]] || exit 0
+nohup /bin/bash -lc \
+  "source \"\$HOME/bin/vault-env\" >/dev/null 2>&1; exec python3 \"\$GATEWAY\" --port ${PORT}" \
+  >/dev/null 2>&1 &
+for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
+  health && exit 0
+  sleep 0.2
+done
+exit 0
