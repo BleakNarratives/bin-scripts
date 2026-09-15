@@ -85,7 +85,10 @@ AUTO_CHAIN = ("deepinfra", "sambanova", "openrouter", "mistral", "gemini",
 FALLBACK_MODEL = {
     "groq": "openai/gpt-oss-120b",
     "cerebras": "llama-3.3-70b",
-    "openrouter": "z-ai/glm-5.2:free",
+    # Verified live 2026-09-15: z-ai/glm-5.2:free answers 404 "Provider
+    # returned error" and google/gemma-4-31b-it:free is temporarily rate
+    # limited. This one returned 200.
+    "openrouter": "nvidia/nemotron-3-super-120b-a12b:free",
     "mistral": "mistral-small-latest",
     # Verified against the live API 2026-09-15: gemini-2.5-flash and -lite are
     # refused for this key ("no longer available to new users"), and
@@ -342,9 +345,68 @@ def status() -> dict:
         if not pool:
             continue
         cooling = sum(1 for k in pool
-                      if _key_state.get(f"{provider}:{_tag(k)}", {}).get("cooldown_until", 0) > now)
-        report[provider] = {"keys": len(pool), "cooling_down": cooling}
+                      if _key_state.get(f"{provider}:{_tag(k)}", {})
+                      .get("cooldown_until", 0) > now)
+        dead_until = _provider_dead_until(provider)
+        report[provider] = {"keys": len(pool), "cooling_down": cooling,
+                            "dead": dead_until > now,
+                            "dead_for_s": int(max(0, dead_until - now))}
     return report
+
+
+def probe_provider(provider: str) -> dict:
+    """Classify one provider with a 1-token chat request.
+
+    WHY A CHAT AND NOT /models: the model-list endpoint answers 200 for a key
+    whose account has no credits and for one with no subscription. Reporting
+    those as "live" is the same false-health pattern that has repeatedly made
+    this tree look healthier than it was. The only call that proves a provider
+    can actually serve is the one it will actually be asked to serve.
+
+    Cost: one prompt token per provider, per invocation.
+    States: live, rate-limited, unpaid, auth-dead, bad-model, unreachable, no-key.
+    """
+    pool = pool_for(provider)
+    if not pool:
+        return {"provider": provider, "keys": 0, "state": "no-key"}
+    url = PROVIDERS.get(provider)
+    if not url:
+        return {"provider": provider, "keys": len(pool), "state": "unknown"}
+
+    payload = json.dumps({
+        "model": FALLBACK_MODEL.get(provider, "default"),
+        "messages": [{"role": "user", "content": "hi"}],
+        "max_tokens": 1,
+    }).encode()
+    req = urllib.request.Request(url, data=payload, method="POST")
+    req.add_header("Content-Type", "application/json")
+    req.add_header("Authorization", f"Bearer {pool[0]}")
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            return {"provider": provider, "keys": len(pool), "state": "live",
+                    "http": resp.status}
+    except urllib.error.HTTPError as e:
+        detail = ""
+        try:
+            detail = e.read().decode()[:600]
+        except Exception:
+            pass
+        if any(s in detail for s in ("insufficient_quota", "credit_balance_exhausted",
+                                     "exceeded your current quota")):
+            state = "unpaid"
+        else:
+            state = {401: "auth-dead", 402: "unpaid", 403: "auth-dead",
+                     404: "bad-model", 429: "rate-limited"}.get(
+                         e.code, f"http-{e.code}")
+        return {"provider": provider, "keys": len(pool), "state": state,
+                "http": e.code}
+    except Exception as e:
+        return {"provider": provider, "keys": len(pool),
+                "state": "unreachable", "error": type(e).__name__}
+
+
+def probe_all() -> list[dict]:
+    return [probe_provider(p) for p in PROVIDERS if pool_for(p)]
 
 
 # ── HTTP ─────────────────────────────────────────────────────────────────────
@@ -363,6 +425,10 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path.startswith("/health"):
             self._send(200, {"status": "alive", "pools": status()})
+        elif self.path.startswith("/providers"):
+            # Explicit dashboard call: probes upstream, so it is separate from
+            # /health (which gateway-ensure hits constantly and must stay cheap).
+            self._send(200, {"providers": probe_all()})
         elif self.path.startswith("/v1/models"):
             ids = []
             for provider, pool in ((p, pool_for(p)) for p in PROVIDERS):

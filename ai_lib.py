@@ -206,6 +206,17 @@ def health() -> dict:
         return {"status": "down", "error": str(exc)}
 
 
+def providers(timeout: int = 45) -> list[dict]:
+    """Live-classify every provider with a key: live / dead / rate-limited."""
+    base = base_url()
+    try:
+        with urllib.request.urlopen(f"{base}/providers", timeout=timeout) as resp:
+            data = json.loads(resp.read() or b"{}")
+        return data.get("providers", []) if isinstance(data, dict) else []
+    except Exception:
+        return []
+
+
 if __name__ == "__main__":
     import sys
     print(ask(" ".join(sys.argv[1:]) or "Say OK."))
