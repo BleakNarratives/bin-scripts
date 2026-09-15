@@ -79,8 +79,12 @@ PROVIDERS = {
 
 # Order "auto" walks. Paid/always-available providers first; the free-tier
 # pools last, since those are the ones that rate-limit or come back revoked.
-AUTO_CHAIN = ("deepinfra", "sambanova", "openrouter", "mistral", "gemini",
-              "openai", "groq", "cerebras")
+# Order is evidence-based, not assumed: Groq is currently the only pool that is
+# fully live (11/11 keys) and free, so it goes first. Paid providers sit next
+# and are inert until a key exists. The flaky free tiers (a 200-with-error body
+# or a silent hang) go last so they cannot swallow a request Groq would serve.
+AUTO_CHAIN = ("groq", "deepinfra", "sambanova", "openrouter", "mistral",
+              "gemini", "openai", "cerebras")
 
 FALLBACK_MODEL = {
     "groq": "openai/gpt-oss-120b",
@@ -274,7 +278,18 @@ def call_upstream(provider: str, model: str, body: dict, timeout: int = 60):
             req.add_header("X-Title", "ai_gateway")
         try:
             with urllib.request.urlopen(req, timeout=timeout) as resp:
-                return resp.status, json.loads(resp.read())
+                payload = json.loads(resp.read())
+                # Some routers answer HTTP 200 with an error envelope when the
+                # upstream provider fails (observed from OpenRouter: "Upstream
+                # error from Nvidia: Service temporarily overloaded"). Passing
+                # that through as success ends the chain on a dead provider and
+                # hands the caller an error it cannot act on.
+                if isinstance(payload, dict) and "error" in payload:
+                    detail = json.dumps(payload.get("error"))[:300]
+                    last = (502, {"error": {"message": detail}})
+                    _cool(provider, key, COOLDOWN_429, "200-with-error")
+                    continue
+                return resp.status, payload
         except urllib.error.HTTPError as e:
             detail = ""
             try:

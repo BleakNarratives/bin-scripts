@@ -68,6 +68,19 @@ ERROR_MARKERS = (
 )
 
 FILE_LINE_RE = re.compile(r'File "([^"]+)", line (\d+)')
+# gather_context() shows code with a "  12 | " gutter because that helps the
+# model locate the line. Models then copy the gutter into the OLD/NEW block
+# verbatim, which never matches the real file, so --apply refuses. Strip it
+# back off before matching — but only when every non-blank line carries one.
+GUTTER_RE = re.compile(r"^\s*\d+\s*\|\s?")
+
+
+def strip_gutter(text: str) -> str:
+    lines = text.split("\n")
+    numbered = [l for l in lines if l.strip()]
+    if numbered and all(GUTTER_RE.match(l) for l in numbered):
+        return "\n".join(GUTTER_RE.sub("", l) for l in lines)
+    return text
 
 PROMPT = """A command failed. Fix it.
 
@@ -154,8 +167,8 @@ def parse_fix(reply: str) -> dict:
         reply, re.S)
     if block:
         out["file"] = block.group(1).strip()
-        out["old"] = block.group(2)
-        out["new"] = block.group(3)
+        out["old"] = strip_gutter(block.group(2))
+        out["new"] = strip_gutter(block.group(3))
     return out
 
 
