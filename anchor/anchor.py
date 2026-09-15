@@ -91,30 +91,34 @@ def main():
         print("       anchor --refresh-models")
         sys.exit(0)
 
-    if args[0] == "--refresh-models":
+    # `args and` is load-bearing: the TTY usage guard above does not fire when
+    # stdin is not a terminal, so cron, scripts, pipes and other agents all
+    # reached these bare args[0] reads and died with IndexError. Matches the
+    # convention the --stats/--web blocks above already use.
+    if args and args[0] == "--refresh-models":
         ok = mdl.refresh_models()
         print("[OK] models refreshed" if ok else "[FAIL]")
         return
 
-    if args[0] == "--run":
+    if args and args[0] == "--run":
         print(tools.run_shell(" ".join(args[1:])))
         return
 
-    if args[0] == "--read":
+    if args and args[0] == "--read":
         print(tools.read_file(args[1]))
         return
 
-    if args[0] == "--search":
+    if args and args[0] == "--search":
         print(patcher.search_codebase(args[1], args[2]))
         return
 
-    if args[0] == "--patch":
+    if args and args[0] == "--patch":
         print(patcher.apply_patch(args[1], args[2], args[3]))
         return
 
     # collect fed files
     fed_content = ""
-    if args[0] == "--feed":
+    if args and args[0] == "--feed":
         args = args[1:]
         while args and os.path.exists(os.path.expanduser(args[0])):
             path = args.pop(0)
