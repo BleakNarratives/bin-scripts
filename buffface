@@ -1,0 +1,49 @@
+#!/usr/bin/env bash
+# buffface -- launch the Freebuff Vertical AI Boardroom stack.
+#
+#   buffface              -> bridge + open the 3D boardroom in the browser
+#   buffface --web        -> open the 3D boardroom in the default browser
+#   buffface --serve      -> start the bridge only (:8766, serves the 3D boardroom at /)
+#   buffface --substrate  -> run the MCP substrate over stdio (for editors/agents)
+#   buffface --status     -> show what is up
+#
+# The bridge auto-starts when missing. NOTE: the buffface-tauri desktop client
+# and Buff-Face TUI were SCRAPPED 2026-09-04 (archived to
+# ~/._archive/buffface_scrap_20260904/). The bridge now serves the operator's
+# existing 3D boardroom stage (static/index.html) at GET /.
+
+BRIDGE_URL="${BRIDGE_URL:-http://127.0.0.1:8766}"
+BRIDGE_LOG="${BUFFFACE_BRIDGE_LOG:-/tmp/buffface_bridge.log}"
+BOARDROOM="${BOARDROOM:-$HOME/The-Werkz/Official-Vertical-AI-Boardroom}"
+PY="${BUFFFACE_PY:-$HOME/Implore-env/bin/python}"
+
+bridge_up() { curl -sf -m 3 "$BRIDGE_URL/health" >/dev/null 2>&1; }
+
+ensure_bridge() {
+  if ! bridge_up; then
+    echo "buffface: starting bridge on :8766..."
+    ( cd "$BOARDROOM" && setsid "$PY" -m uvicorn buffface_server:app --port 8766 --log-level warning >"$BRIDGE_LOG" 2>&1 & )
+    for _ in $(seq 1 30); do bridge_up && return 0; sleep 1; done
+    echo "buffface: bridge failed to start -- see $BRIDGE_LOG" >&2
+    return 1
+  fi
+  return 0
+}
+
+case "${1:-}" in
+  --web|--serve|"")
+    ensure_bridge || exit 1
+    echo "buffface: bridge online at $BRIDGE_URL (3D boardroom at /)"
+    if [ "${1:-}" != "--serve" ]; then xdg-open "$BRIDGE_URL" >/dev/null 2>&1 || true; fi
+    ;;
+  --substrate)
+    ensure_bridge
+    exec "$HOME/New-Heights/universal-mcp-core/target/release/universal-mcp-core" 2>/dev/null \
+      || exec "$HOME/New-Heights/universal-mcp-core/target/debug/universal-mcp-core" ;;
+  --status)
+    if bridge_up; then echo "bridge: online ($BRIDGE_URL)"; else echo "bridge: offline"; fi
+    ss -ltn 2>/dev/null | grep -E ':(8766|8767|8800)' | awk '{print $4}' || true ;;
+  *)
+    echo "buffface: unknown option '$1' (--web | --serve | --substrate | --status)" >&2
+    exit 2 ;;
+esac

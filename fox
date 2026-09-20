@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# fox — OpenRouter chat TUI. Keys via concierge vault, never persisted.
+. "$HOME/bin/vault-env" >/dev/null 2>&1
+exec /usr/bin/python3 "$HOME/bin/fox-real" "$@"

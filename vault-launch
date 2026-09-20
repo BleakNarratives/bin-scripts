@@ -19,6 +19,14 @@ if [[ "${AI_GATEWAY_NO_AUTOSTART:-0}" != 1 && -x "$HOME/bin/gateway-ensure" ]]; 
   "$HOME/bin/gateway-ensure" >/dev/null 2>&1 || true
 fi
 
+# Gateway-backed providers are declared with an api_key_env_var, and Vibe treats
+# a provider whose key variable is unset as unauthenticated -- it refuses with
+# "Missing <VAR> environment variable" before it ever reaches loopback. The
+# gateway ignores the header entirely, so the value only has to exist.
+# Defined here rather than in ~/.vibe/.env so every wrapped CLI (aider, vibe,
+# codex, ox) shares one definition and no fake secret is written to disk.
+export AI_GATEWAY_KEY="${AI_GATEWAY_KEY:-local-gateway}"
+
 SNAPSHOT_TOOL="${HOME}/RootBase/agent_asset_snapshot.py"
 snapshot_assets() {
   # Asset preservation is intentionally best-effort and disabled for doctor,

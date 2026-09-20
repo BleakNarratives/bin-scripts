@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# council — codebase boardroom that SEES the repo (state + sims), humane, local
+# usage: council ~/Official-Vertical-AI-Boardroom --rounds 1
+#        council ~/p_recovery --rounds 1
+#        council . --out /tmp/dev_br.json --live
+exec python3 ~/tools/introspection/codebase_boardroom.py "$@"

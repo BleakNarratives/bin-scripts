@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# swinefeed — sync RootBase model_registry.json into SwineHerd ranking caches.
+cd "$HOME/SwineHerd" || exit 1
+exec /usr/bin/python3 -m scouts.model_feed "$@"

@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+# where-was-i — no memory needed
+p="$HOME/.sherpa/today_$(date +%Y-%m-%d).md"
+if [[ -f "$p" ]]; then
+  echo "┌─ where-was-i — $(date +%Y-%m-%d)"
+  cat "$p"
+  echo "└─ tip: cd that path, then `sherpa`"
+else
+  echo "No trail yet today — `sherpa` once and I'll remember for you."
+  ls -1 "$HOME/.sherpa/today_"*.md 2>/dev/null | tail -n 3 | xargs -I{} sh -c 'echo "── {}"; cat {} | tail -n 20' 2>/dev/null
+fi

@@ -1,4 +1,15 @@
 #!/usr/bin/env python3
+
+# [DNA_TAG]
+# ORIGIN: Crostini-Chromebook
+# PILLAR: workspace-hygiene
+# DEPS: filecmp,hashlib,os,shutil
+# ROLE: bin copy: reconcile staging dir into production dir (canonical in ~)
+# AUTHOR: Bleak
+# SESSION: 2026-09-11
+# TIER: 4
+# [/DNA_TAG]
+
 import os
 import re
 import hashlib

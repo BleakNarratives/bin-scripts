@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+if [[ "$1" == "--egg" || "$1" == "fartographer" || "$1" == "loom" || "$1" == "cartographer" || "$1" == "extra" || "$1" == "--extra" ]]; then
+  echo "┌────────────────────────────────────────────┐"
+  echo "│  🗺️  Fartographer lives inside Sherpa.     │"
+  echo "│  📡  Loomy lives inside Sherpa.            │"
+  echo "│  You were right both times. One name       │"
+  echo "│  now carries both — cd + sherpa and        │"
+  echo "│  the folder remembers after you sleep.     │"
+  echo "│          sherpa --write · where-was-i      │"
+  echo "│          Force: c  (one letter)            │"
+  echo "│                                            │"
+  echo "│  🥚 EXTRA INNINGS: sherpa --egg            │"
+  echo "│     hc --dry-run  → humane merge preview   │"
+  echo "│     cm            → codemap stats, no html │"
+  echo "│     where-was-i   → today's trail back     │"
+  echo "└────────────────────────────────────────────┘"
+  if [[ "$1" == "--egg" || "$1" == "--extra" || "$1" == "extra" ]]; then exit 0; fi
+  shift
+  if [[ $# -eq 0 ]]; then exit 0; fi
+fi
+exec python3 ~/tools/curator/curator.py "$@"

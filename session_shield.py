@@ -1,4 +1,15 @@
 #!/usr/bin/env python3
+
+# [DNA_TAG]
+# ORIGIN: Crostini-Chromebook
+# PILLAR: swarm
+# DEPS: os,sys
+# ROLE: Pin oom_score_adj on interactive session processes
+# AUTHOR: Bleak
+# SESSION: 2026-09-11
+# TIER: 4
+# [/DNA_TAG]
+
 """session_shield.py — pin oom_score_adj on the interactive session stack.
 
 Runs as root (systemd unit session-shield.service). Every 3s it pins

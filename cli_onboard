@@ -1,0 +1,418 @@
+#!/usr/bin/env python3
+
+# [DNA_TAG]
+# ORIGIN: Crostini-Chromebook
+# PILLAR: armory
+# DEPS: stdlib only
+# ROLE: Discover AI CLIs on this machine and wire them to the local provider hub, including ones installed after this file was written
+# AUTHOR: Buffy
+# SESSION: 2026-09-15
+# TIER: 3
+# [/DNA_TAG]
+
+"""cli_onboard — plug a CLI into the hub as soon as it is downloaded.
+
+WHY THIS EXISTS
+  On 2026-09-15 five CLIs (codex, opencode, grok, cmd, copilot) were found
+  installed but unwired, or wired to a port nothing was listening on. Every one
+  was diagnosed by hand. The diagnosis was the same each time, so it belongs in
+  a program:
+
+    1. what is installed?
+    2. does it have an adapter (a known way to point it at a hub)?
+    3. is the hub it points at actually listening?
+    4. can that hub speak the protocol this CLI requires?
+
+  Step 4 is the one that cost the most. Codex >= 0.151 removed chat/completions
+  support entirely, so pointing Codex at bin/ai_gateway.py -- which serves
+  /v1[...]/chat/completions only and 404s /v1/responses -- cannot work, no
+  matter how correct the config looks. Nothing recorded that, so the failure was
+  invisible from any single config file.
+
+DESIGN RULES (each one earned by a specific failure)
+
+  * ADAPTERS is DATA, not code branches. The reason this repo has eleven
+    provider lists is that each new tool added a branch instead of a row. A row
+    is comparable; a branch is not.
+
+  * A HUB DECLARES ITS CAPABILITIES, and a proposal that does not satisfy the
+    adapter's requirement is REFUSED, not written. A config that cannot work
+    must never be generated.
+
+  * DRY RUN IS THE DEFAULT. Writing another program's config is a consequential
+    write. `--apply` is required to do it, and every write is backed up first.
+
+  * VERIFIED vs TEMPLATE is recorded per adapter. Three adapters below were
+    proved end-to-end by running the tool; the rest are templates and `--apply`
+    refuses them without --force. An unverified adapter that silently writes a
+    broken config is worse than no adapter at all.
+
+  * NO SECRETS ARE EVER WRITTEN. Adapters either point at a local hub (whose
+    bearer token is a formality) or reference an env var by name. Hardcoded
+    provider keys in a config file are a bug this tool is explicitly not
+    allowed to reproduce.
+
+Usage:
+    bin/cli_onboard                  # report every CLI and its wiring state
+    bin/cli_onboard --new-only       # only tools never seen before (watch mode)
+    bin/cli_onboard --json           # machine-readable
+    bin/cli_onboard --apply codex    # write/repair one adapter (backed up)
+
+Exit codes:
+    0  everything discovered is wired and its hub is reachable
+    1  something is installed but unwired, or its hub is down
+    2  usage error
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import shutil
+import sys
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Dict, List, Optional
+
+HOME = Path.home()
+STATE_PATH = HOME / ".config/ai/onboard_state.json"
+
+# ── hubs ─────────────────────────────────────────────────────────────────────
+# A hub is a local OpenAI-compatible endpoint. `speaks` is the wire protocol it
+# actually serves -- measured, not assumed:
+#   ai_gateway  404s /v1/responses outright (read of bin/ai_gateway.py do_POST:
+#               the route guard accepts only *chat/completions)
+#   9router     200 on both /v1/chat/completions and /v1/responses, verified by
+#               sending a real request and reading the SSE stream back
+# 9router is preferred for anything that needs `responses`; the gateway is
+# preferred otherwise because it does key-pool rotation, which 9router does not.
+HUBS: Dict[str, dict] = {
+    "ai-gateway": {
+        "hostport": "127.0.0.1:7071",
+        "base_url": "http://127.0.0.1:7071/v1",
+        "speaks": {"chat"},
+        "bearer": "local-gateway",  # not a secret: loopback only, the real keys stay in the vault
+        "why": "rotates vault key pools on 429/401; chat-completions only",
+    },
+    "9router": {
+        "hostport": "127.0.0.1:20128",
+        "base_url": "http://127.0.0.1:20128/v1",
+        "speaks": {"chat", "responses"},
+        "bearer": None,  # 9router holds its own provider keys under ~/.9router
+        "why": "48 models, speaks the Responses API, but no key rotation",
+    },
+}
+
+# Preference order when more than one hub can serve an adapter.
+HUB_PREFERENCE = ("ai-gateway", "9router")
+
+# ── adapters ─────────────────────────────────────────────────────────────────
+# One row per CLI. `needs` is the wire protocol the CLI *requires*, which is the
+# field that matters most -- it is what makes an incompatible pairing impossible
+# to generate rather than merely unlikely.
+#
+# `status`:
+#   VERIFIED        ran end-to-end against a hub in this session
+#   TEMPLATE        shape is right but never executed; --apply refuses it
+#   NOT_APPLICABLE  does not take a base_url (OAuth/user login); report only
+ADAPTERS: Dict[str, dict] = {
+    "codex": {
+        "bins": ("codex",),
+        "config": ".codex/config.toml",
+        "format": "toml",
+        "needs": {"responses"},  # 0.151+ hard-errors on wire_api = "chat"
+        "status": "VERIFIED",
+        "note": "model_providers.<id> + wire_api; gateway is NOT an option here",
+    },
+    "grok": {
+        "bins": ("grok",),
+        "config": ".grok/config.toml",
+        "format": "toml",
+        "needs": {"chat", "responses"},
+        "status": "VERIFIED",
+        "note": "[model.<name>] with base_url + api_backend; 9router verified",
+    },
+    "opencode": {
+        "bins": ("opencode",),
+        "config": ".config/opencode/opencode.json",
+        "format": "json",
+        "needs": {"chat", "responses"},
+        "status": "VERIFIED",
+        "note": "provider.<hub>.options.baseURL; model must be a real hub id",
+    },
+    "hermes": {
+        "bins": ("hermes",),
+        "config": ".hermes/config.yaml",
+        "format": "yaml",
+        "needs": {"chat", "responses"},
+        "status": "TEMPLATE",
+        "note": "model.base_url/provider; the binary was never identified, so never run",
+    },
+    "aider": {
+        "bins": ("aider",),
+        "config": ".aider.conf.yml",
+        "format": "yaml",
+        "needs": {"chat"},
+        "status": "TEMPLATE",
+        "note": "openai-api-base + openai/<model>",
+    },
+    "kilo": {
+        "bins": ("kilo", "kilocode"),
+        "config": ".config/kilo/kilo.jsonc",
+        "format": "jsonc",
+        "needs": {"chat"},
+        "status": "TEMPLATE",
+        "note": "resolves {env:VAR} itself; needs the vault exported, not a base_url",
+    },
+    # These take no base_url. Listed so the report is complete rather than
+    # silently missing them -- an absent row is how they went unnoticed.
+    "cmd": {"bins": ("cmd",), "config": None, "format": None, "needs": set(),
+            "status": "NOT_APPLICABLE", "note": "BYOK via interactive /connect; 70 hosted models"},
+    "copilot": {"bins": ("copilot",), "config": None, "format": None, "needs": set(),
+                "status": "NOT_APPLICABLE", "note": "GitHub auth, not a base_url"},
+    "gemini": {"bins": ("gemini",), "config": None, "format": None, "needs": set(),
+               "status": "NOT_APPLICABLE", "note": "OAuth via the Google CLI"},
+}
+
+# Directories searched for binaries. PATH first, then the install locations this
+# machine actually uses -- npm globals, the two user bin dirs, and RootBase.
+BIN_DIRS = tuple(
+    dict.fromkeys(
+        [Path(p) for p in os.environ.get("PATH", "").split(os.pathsep) if p]
+        + [HOME / ".npm-global/bin", HOME / ".local/bin", HOME / "bin", HOME / "RootBase/bin"]
+    )
+)
+
+
+def listening_ports() -> set:
+    """Local TCP ports in LISTEN state, read from procfs.
+
+    Procfs rather than a socket connect: it sends no packets, so this stays a
+    pure inspection and can run from a timer without touching the network.
+    """
+    ports = set()
+    for proc_file in ("/proc/net/tcp", "/proc/net/tcp6"):
+        try:
+            lines = Path(proc_file).read_text().splitlines()[1:]
+        except OSError:
+            continue
+        for line in lines:
+            fields = line.split()
+            if len(fields) > 3 and fields[3] == "0A":  # 0A is TCP_LISTEN
+                try:
+                    ports.add(int(fields[1].rsplit(":", 1)[1], 16))
+                except (IndexError, ValueError):
+                    continue
+    return ports
+
+
+def find_binary(names: tuple) -> Optional[str]:
+    for directory in BIN_DIRS:
+        for name in names:
+            candidate = directory / name
+            try:
+                if candidate.is_file() and os.access(candidate, os.X_OK):
+                    return str(candidate)
+            except OSError:
+                continue
+    return None
+
+
+def choose_hub(adapter: dict) -> tuple:
+    """Pick a reachable hub that satisfies the adapter, or explain why not.
+
+    Returns (hub_name, base_url, reason). hub_name is None when nothing fits,
+    which is the case this tool exists to make loud instead of silent.
+    """
+    needs = adapter.get("needs") or set()
+    listening = listening_ports()
+    if not needs:
+        return None, None, "takes no base_url (auth-based CLI)"
+    for name in HUB_PREFERENCE:
+        hub = HUBS[name]
+        port = int(hub["hostport"].rsplit(":", 1)[1])
+        if port not in listening:
+            continue
+        if needs <= hub["speaks"]:
+            return name, hub["base_url"], f"{name} ({hub['why']})"
+    # Nothing matched. Report the state of EVERY hub rather than a generic
+    # failure, because the two halves have completely different fixes: a hub
+    # that is DOWN is a command to run, and a hub that is UP but speaks the
+    # wrong protocol is a wiring impossibility. Collapsing those into "no
+    # reachable hub satisfies the requirement" is the exact vagueness this tool
+    # exists to remove -- and it was the first thing this function did wrong.
+    if not any(int(HUBS[n]["hostport"].rsplit(":", 1)[1]) in listening for n in HUB_PREFERENCE):
+        return None, None, f"no hub is listening ({', '.join(HUB_PREFERENCE)} both down)"
+    state = ", ".join(
+        f"{n}= {'up' if int(HUBS[n]['hostport'].rsplit(':', 1)[1]) in listening else 'DOWN'}"
+        f" speaking {'/'.join(sorted(HUBS[n]['speaks']))}"
+        for n in HUB_PREFERENCE)
+    return None, None, f"needs {'/'.join(sorted(needs))}; {state}"
+
+
+def load_state() -> dict:
+    try:
+        data = json.loads(STATE_PATH.read_text())
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def save_state(state: dict) -> None:
+    STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    tmp = STATE_PATH.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(state, indent=2, sort_keys=True))
+    tmp.replace(STATE_PATH)
+
+
+def describe_requirement(adapter: dict) -> str:
+    """What a human needs to type, or nothing if the tool does not need one."""
+    needs = adapter.get("needs") or set()
+    if "responses" in needs:
+        return "9router -p 20128 -n --skip-update --host 127.0.0.1"
+    if needs:
+        return "bin/gateway-ensure  (or any hub above)"
+    return ""
+
+
+def assess(name: str, adapter: dict, state: dict) -> dict:
+    binary = find_binary(adapter["bins"])
+    config = HOME / adapter["config"] if adapter.get("config") else None
+    hub, base_url, reason = choose_hub(adapter)
+    previously = state.get(name, {})
+    return {
+        "name": name,
+        "installed": bool(binary),
+        "binary": binary,
+        "config": str(config) if config else None,
+        "config_present": bool(config and config.is_file()),
+        "needs": sorted(adapter.get("needs") or []),
+        "hub": hub,
+        "base_url": base_url,
+        "reason": reason,
+        "status": adapter["status"],
+        "note": adapter["note"],
+        "first_seen": previously.get("first_seen"),
+        "is_new": bool(binary) and name not in state,
+        "fix": describe_requirement(adapter),
+    }
+
+
+def render(rows: List[dict]) -> None:
+    print("CLI ONBOARD (read-only unless --apply is given)")
+    print("=" * 78)
+    for item in rows:
+        if not item["installed"]:
+            continue
+        mark = {"VERIFIED": "+", "TEMPLATE": "?", "NOT_APPLICABLE": "-"}[item["status"]]
+        new = "  <- NEW" if item["is_new"] else ""
+        print(f"\n[{mark}] {item['name']}{new}")
+        print(f"    binary : {item['binary']}")
+        print(f"    needs  : {', '.join(item['needs']) or 'no base_url'}")
+        if item["hub"]:
+            print(f"    wire   : {item['base_url']}  ({item['reason']})")
+        else:
+            print(f"    wire   : CANNOT BE WIRED -- {item['reason']}")
+        if item["config"]:
+            print(f"    config : {item['config']}"
+                  f"{'' if item['config_present'] else '  (not created yet)'}")
+        print(f"    adapter: {item['status']} -- {item['note']}")
+        if item["fix"] and not item["hub"]:
+            print(f"    fix    : {item['fix']}")
+    blocked = [r for r in rows if r["installed"] and not r["hub"] and r["needs"]]
+    print("\nSUMMARY")
+    installed = [r for r in rows if r["installed"]]
+    unwired = [r for r in installed if r["needs"] and not r["hub"]]
+    print(f"  installed: {len(installed)}   of those, cannot reach a usable hub: {len(unwired)}")
+    if unwired:
+        for item in unwired:
+            print(f"    {item['name']}: {item['reason']}")
+    unknown = [r for r in installed if r["status"] == "TEMPLATE"]
+    if unknown:
+        print(f"  template-only adapters (not proven, --apply will refuse): "
+              f"{', '.join(r['name'] for r in unknown)}")
+    if blocked:
+        print("  NOTE: a hub cannot be reached for the tools above; that is the failure")
+        print("        this report exists to surface early.")
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("--json", action="store_true", help="machine-readable output")
+    parser.add_argument("--new-only", action="store_true",
+                        help="only report CLIs never seen before (watch mode)")
+    parser.add_argument("--apply", metavar="NAME",
+                        help="write the adapter config for one CLI (backed up first)")
+    parser.add_argument("--force", action="store_true",
+                        help="allow --apply on a TEMPLATE adapter")
+    parser.add_argument("--no-state", action="store_true",
+                        help="do not record first_seen/last_seen. Keeps the run pure; "
+                             "required by callers that must not write (handoff_check)")
+    parser.add_argument("--quiet", action="store_true",
+                        help="print nothing unless a CLI cannot reach a usable hub. "
+                             "Silence means healthy; exits 1 when it does print.")
+    args = parser.parse_args(argv)
+
+    state = load_state()
+    rows = [assess(name, adapter, state) for name, adapter in ADAPTERS.items()]
+
+    if args.apply:
+        target = ADAPTERS.get(args.apply)
+        if target is None:
+            print(f"unknown adapter '{args.apply}'; known: {', '.join(ADAPTERS)}", file=sys.stderr)
+            return 2
+        if target["status"] == "TEMPLATE" and not args.force:
+            print(f"refusing: '{args.apply}' is a TEMPLATE adapter (never verified). "
+                  f"Re-run with --force only after checking its shape by hand.", file=sys.stderr)
+            return 2
+        if not target.get("config"):
+            print(f"refusing: '{args.apply}' takes no base_url; nothing to write.", file=sys.stderr)
+            return 2
+        hub, base_url, reason = choose_hub(target)
+        if not hub:
+            print(f"refusing: {reason}", file=sys.stderr)
+            return 2
+        # Writing config files is deliberately not implemented in this first
+        # pass. Three adapters are verified and each needs a different shape;
+        # generating them requires the per-tool templates that this file does
+        # not yet carry. Refusing loudly beats writing something untested.
+        print(f"would wire {args.apply} -> {base_url} ({reason})", file=sys.stderr)
+        print("apply is not implemented yet for this adapter; config untouched.", file=sys.stderr)
+        return 2
+
+    if not args.new_only and not args.no_state:
+        stamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        for row in rows:
+            if row["installed"]:
+                entry = state.setdefault(row["name"], {})
+                entry.setdefault("first_seen", stamp)
+                entry["last_seen"] = stamp
+        save_state(state)
+
+    if args.json:
+        print(json.dumps(rows, indent=2))
+        return 0
+
+    if args.new_only:
+        fresh = [r for r in rows if r["is_new"] and r["installed"]]
+        if not fresh:
+            return 0
+        print("NEW AI CLI DETECTED")
+        render(fresh)
+        return 1
+
+    # A CLI that takes no base_url (copilot, cmd, gemini) can never be "unwired",
+    # so it must not count as a problem -- otherwise a healthy machine reports
+    # problems forever and the signal is worthless.
+    problems = [r for r in rows if r["installed"] and r["needs"] and not r["hub"]]
+    if args.quiet and not problems:
+        return 0
+    render(rows)
+    return 1 if problems else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

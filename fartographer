@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# fartographer — the cartographer that never died, just got promoted to the council 💨🗺️
+echo "💨 fartographer reporting for duty — you were right the first time (now with council powers)..." >&2
+exec python3 ~/tools/introspection/codebase_boardroom.py "$@"

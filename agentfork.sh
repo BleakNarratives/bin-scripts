@@ -4,7 +4,7 @@
 #
 # The machine is memory-bound (2.6Gi total) and freebuff is single-instance
 # (lock held by the parent). So "sub-agents" = qwen / codex / goose / ox /
-# aider, each launched in its OWN tmux session (never panes inside the live
+# aider, each launched in its OWN tmux -S /tmp/kilo/tmux session (never panes inside the live
 # session). Supplies each with a task file typed in via send-keys, and asks
 # for a sentinel so the parent can poll rather than babysit.
 #
@@ -60,9 +60,9 @@ mem_ok() {
   [[ "${avail_mb:-0}" -ge "$MIN_AVAIL" ]]
 }
 
-fork_running() { tmux has-session -t "fork-$1" 2>/dev/null; }
+fork_running() { tmux -S /tmp/kilo/tmux has-session -t "fork-$1" 2>/dev/null; }
 
-count_forks() { tmux ls 2>/dev/null | grep -c '^fork-' || true; }
+count_forks() { tmux -S /tmp/kilo/tmux ls 2>/dev/null | grep -c '^fork-' || true; }
 
 start() {
   local name="" agent="aider" style="" taskfile="" prompt="" model="$AIDER_MODEL" \
@@ -120,7 +120,7 @@ start() {
     local help_flags="--no-auto-commits --no-show-model-warnings --yes"
     local edge_flags="--message"
     # build the one-shot command: env; aider model file(s) -m '<body>'
-    tmux new-session -d -s "fork-$name" \
+    tmux -S /tmp/kilo/tmux new-session -d -s "fork-$name" \
       "cd $PWD; ${envpre}exec $cli --model '$model' ${flist[*]:+${flist[*]} }$help_flags --message $(printf '%q' "$payload") 2>&1 | tee -a '$out'; echo '== FORK EXIT ==' >> '$out'"
     echo "• fork '$name' spawned (agent=aider cli=$cli model=$model)"
     echo "  task : $task   out : $out   files: ${flist[*]:-none}"
@@ -135,11 +135,11 @@ start() {
     else
       launch_cmd="$cli ${model:+-m $model}"   # interactive; we send-keys the file
     fi
-    tmux new-session -d -s "fork-$name" "cd $PWD; $launch_cmd 2>&1 | tee -a '$out'; echo '== FORK EXIT ==' >> '$out'"
+    tmux -S /tmp/kilo/tmux new-session -d -s "fork-$name" "cd $PWD; $launch_cmd 2>&1 | tee -a '$out'; echo '== FORK EXIT ==' >> '$out'"
     if [[ "$style" == "file" ]]; then
       sleep 2
-      tmux send-keys -t "fork-$name" -l "$payload"
-      tmux send-keys -t "fork-$name" Enter
+      tmux -S /tmp/kilo/tmux send-keys -t "fork-$name" -l "$payload"
+      tmux -S /tmp/kilo/tmux send-keys -t "fork-$name" Enter
     fi
     echo "• fork '$name' spawned (agent=$agent cli=$cli style=$style)"
     echo "  task : $task   out : $out"
@@ -152,20 +152,20 @@ start() {
     sleep "$maxsecs"
     if fork_running "$name" && ! grep -q '<<COMPLETE>>' "$out" 2>/dev/null; then
       echo "== TIMEOUT after ${maxsecs}s ==" >> "$out"
-      tmux send-keys -t "fork-$name" C-c 2>/dev/null
-      sleep 2; tmux kill-session -t "fork-$name" 2>/dev/null || true
+      tmux -S /tmp/kilo/tmux send-keys -t "fork-$name" C-c 2>/dev/null
+      sleep 2; tmux -S /tmp/kilo/tmux kill-session -t "fork-$name" 2>/dev/null || true
     fi
   ) &
 }
 
 status() {
   if [[ $# -eq 0 ]]; then
-    # Enumerate from the log dir so completed forks (whose tmux session has
+    # Enumerate from the log dir so completed forks (whose tmux -S /tmp/kilo/tmux session has
     # exited and vanished) still appear.
     local found=0 n
     for f in "$LOG_ROOT"/*.out; do [[ -e "$f" ]] || continue; n=$(basename "$f" .out); status "$n"; found=1; done
     # plus any live session not in logs yet
-    for s in $(tmux ls 2>/dev/null | grep '^fork-' | cut -d: -f1 | sed s/^fork-//); do
+    for s in $(tmux -S /tmp/kilo/tmux ls 2>/dev/null | grep '^fork-' | cut -d: -f1 | sed s/^fork-//); do
       [[ -e "$LOG_ROOT/$s.out" ]] || { status "$s"; found=1; }
     done
     [[ $found -eq 1 ]] || echo "  (no forks recorded)"
@@ -191,8 +191,8 @@ list() {
 
 collect() { local n="$1"; [[ -f "$LOG_ROOT/$n.out" ]] && tail -n 400 "$LOG_ROOT/$n.out" || echo "no log: $n"; }
 capture() { local n="$1"; [[ -f "$LOG_ROOT/$n.out" ]] && cat "$LOG_ROOT/$n.out" || echo "no log: $n"; }
-attach() { tmux attach -t "fork-$1"; }
-kill_fork() { tmux send-keys -t "fork-$1" C-c 2>/dev/null; tmux kill-session -t "fork-$1" 2>/dev/null || true; }
+attach() { tmux -S /tmp/kilo/tmux attach -t "fork-$1"; }
+kill_fork() { tmux -S /tmp/kilo/tmux send-keys -t "fork-$1" C-c 2>/dev/null; tmux -S /tmp/kilo/tmux kill-session -t "fork-$1" 2>/dev/null || true; }
 
 case "${1:-}" in
   start)   shift; start "$@";;

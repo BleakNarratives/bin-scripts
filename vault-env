@@ -32,6 +32,16 @@ mapping = {
     "orcarouter": "ORCAROUTER_API_KEY",
     "bazaar": "BAZAAR_API_KEY",
     "openai": "OPENAI_API_KEY",
+    # Puter uses the OpenAI-compatible surface at api.puter.com. Unlike every
+    # other provider here it has no model-listing endpoint (GET /v1/models
+    # returns 404), so the usual probe cannot confirm it -- a real chat call is
+    # the only honest check. Verified 2026-09-15: base URL and Bearer auth are
+    # correct; the account answers 402 subscription required.
+    #
+    # NOTE: this whole python block is a SINGLE-QUOTED shell string, so an
+    # apostrophe anywhere in these comments ends it and mangles the script.
+    # Keep this block free of apostrophes.
+    "puter": "PUTER_API_KEY",
     "jules": "JULES_API_KEY",
     "swarms": "SWARMS_API_KEY",
     "mistral": "MISTRAL_API_KEY",

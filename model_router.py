@@ -1,4 +1,15 @@
 #!/usr/bin/env python3
+
+# [DNA_TAG]
+# ORIGIN: Crostini-Chromebook
+# PILLAR: armory
+# DEPS: json,os,subprocess,sys
+# ROLE: Route prompts to Ollama, Gemini, Mistral, or fallback
+# AUTHOR: Bleak
+# SESSION: 2026-09-11
+# TIER: 3
+# [/DNA_TAG]
+
 """
 MODEL ROUTER - Routes prompts to Ollama, Gemini, Mistral, or fallback.
 Run: python3 ~/bin/model_router.py --prompt "Hello" --model gemini

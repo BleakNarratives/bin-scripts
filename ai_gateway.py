@@ -49,12 +49,17 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import sys
 import threading
 import time
 import urllib.error
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+
+# ai_trace lives beside this file. Insert the directory so `import ai_trace`
+# resolves regardless of the working directory the unit starts us in.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 VAULT_JSON = Path.home() / ".concierge" / "vault.json"
 LOG_FILE = Path.home() / "ai_gateway.log"
@@ -75,6 +80,22 @@ PROVIDERS = {
     # free-tier rate-limit problem without any further wiring.
     "deepinfra": "https://api.deepinfra.com/v1/openai/chat/completions",
     "sambanova": "https://api.sambanova.ai/v1/chat/completions",
+    # ── reconciled 2026-09-15 ────────────────────────────────────────────
+    # The vault carried 14 pools but the gateway could only route 8, so these
+    # keys arrived and were never read. Each URL below was verified live the
+    # same day: every one returned 200 from GET /v1/models, which proves the
+    # host AND the key are real. Chat behaviour per pool is noted in
+    # FALLBACK_MODEL next to each entry.
+    #
+    # The name on the left MUST equal the vault pool name — keys_by_provider is
+    # keyed by it — which is why `bazaar` points at bazaarlink.ai. That is
+    # where sk-bl- keys actually authenticate; bazaar.ai is not their host.
+    "swarms": "https://api.swarms.world/v1/chat/completions",
+    "bazaar": "https://api.bazaarlink.ai/v1/chat/completions",
+    "zenmux": "https://zenmux.ai/api/v1/chat/completions",
+    "orcarouter": "https://api.orcarouter.ai/v1/chat/completions",
+    "sageox": "https://api.sageox.ai/v1/chat/completions",
+    "puter": "https://api.puter.com/puterai/openai/v1/chat/completions",
 }
 
 # Order "auto" walks. Paid/always-available providers first; the free-tier
@@ -83,8 +104,16 @@ PROVIDERS = {
 # fully live (11/11 keys) and free, so it goes first. Paid providers sit next
 # and are inert until a key exists. The flaky free tiers (a 200-with-error body
 # or a silent hang) go last so they cannot swallow a request Groq would serve.
-AUTO_CHAIN = ("groq", "deepinfra", "sambanova", "openrouter", "mistral",
-              "gemini", "openai", "cerebras")
+# Verified live 2026-09-15 with a real completion: swarms is free, answers in
+# 2.30-4.7s, and fronts 1908 model ids (including gemini-3.1-pro-preview), so
+# it sits second — it is the second pool that is actually serving traffic.
+# Everything after `cerebras` is wired but inert for an ACCOUNT reason, not a
+# key or URL reason, so it is parked at the tail rather than adding a
+# guaranteed-failing hop to every "auto" request. Promote a pool once its
+# account issue is cleared.
+AUTO_CHAIN = ("groq", "swarms", "deepinfra", "sambanova", "openrouter",
+              "mistral", "gemini", "openai", "cerebras", "bazaar",
+              "orcarouter", "zenmux", "sageox", "puter")
 
 FALLBACK_MODEL = {
     "groq": "openai/gpt-oss-120b",
@@ -109,6 +138,22 @@ FALLBACK_MODEL = {
     # the key exists — a wrong id 404s and the chain falls through.
     "deepinfra": "meta-llama/Meta-Llama-3.3-70B-Instruct",
     "sambanova": "Meta-Llama-3.3-70B-Instruct",
+    # swarms: fastest of five ids tested on 2026-09-15 (2.30s). Bare ids like
+    # "gpt-4o-mini" also work, but the namespaced form is what /v1/models
+    # advertises, so it will not drift.
+    "swarms": "cerebras/qwen-3-32b",
+    # The five below are wired and currently inert. Each /v1/models returned
+    # 200, so the endpoint and key are correct — the account is the blocker:
+    #   bazaar     402 insufficient credits (top up)
+    #   orcarouter 429 free models locked until a GitHub account is linked
+    #   zenmux     403 api_key_source: payg — key has no entitlement
+    #   sageox     502 provider temporarily unavailable (upstream, retryable)
+    #   puter      402 subscription required (all 4 model families refused)
+    "bazaar": "qwen3.8-max",
+    "orcarouter": "orcarouter/free",
+    "zenmux": "google/gemini-3.8-flash",
+    "sageox": "sageox-1-lite",
+    "puter": "gpt-5.4-nano",
 }
 
 # Cloudflare sits in front of several providers (Groq, Cerebras) and bans
@@ -191,6 +236,17 @@ def _tag(key: str) -> str:
     return f"{key[:4]}...{key[-4:]}" if len(key) > 10 else "short"
 
 
+def _key_fingerprint(key: str) -> str:
+    """Non-reversible pool-key id, for the trace store.
+
+    Deliberately NOT `_tag()`: that reveals the first and last four characters,
+    which is fine for a rotating log line and not fine for a store that outlives
+    the log and is meant to be shippable as training corpus.
+    """
+    import hashlib
+    return "k" + hashlib.sha256(key.encode("utf-8", "replace")).hexdigest()[:10]
+
+
 def next_keys(provider: str) -> list[str]:
     """Pool ordered from the round-robin cursor, skipping cooled-down keys.
 
@@ -245,8 +301,18 @@ def _mark_dead_if_all_auth(provider: str) -> None:
 
 # ── upstream call ────────────────────────────────────────────────────────────
 
-def call_upstream(provider: str, model: str, body: dict, timeout: int = 60):
-    """POST to one provider, rotating keys. Returns (status, payload_dict)."""
+def call_upstream(provider: str, model: str, body: dict, timeout: int = 60,
+                  meta: dict | None = None):
+    """POST to one provider, rotating keys. Returns (status, payload_dict).
+
+    If `meta` is provided it is filled in with which provider answered, how many
+    upstream attempts it took, and a non-reversible key fingerprint. Provenance
+    has to originate here: route() cannot know which candidate answered, and the
+    caller cannot know which key the rotation actually picked.
+    """
+    if meta is not None:
+        meta.setdefault("provider", provider)
+        meta.setdefault("model", model)
     url = PROVIDERS.get(provider)
     if not url:
         return 400, {"error": {"message": f"unknown provider '{provider}'"}}
@@ -289,6 +355,9 @@ def call_upstream(provider: str, model: str, body: dict, timeout: int = 60):
                     last = (502, {"error": {"message": detail}})
                     _cool(provider, key, COOLDOWN_429, "200-with-error")
                     continue
+                if meta is not None:
+                    meta["attempts"] = attempt + 1
+                    meta["key_tag"] = _key_fingerprint(key)
                 return resp.status, payload
         except urllib.error.HTTPError as e:
             detail = ""
@@ -323,14 +392,21 @@ def call_upstream(provider: str, model: str, body: dict, timeout: int = 60):
             _cool(provider, key, COOLDOWN_429, "transport")
             continue
     _mark_dead_if_all_auth(provider)
+    if meta is not None:
+        meta["attempts"] = min(MAX_ATTEMPTS, len(keys) * 3)
     return last
 
 
-def route(model: str, body: dict, provider: str | None = None):
+def route(model: str, body: dict, provider: str | None = None,
+          meta: dict | None = None):
     """Pick the upstream provider and call it, with fallback for 'auto'.
 
     Precedence: explicit provider from the URL path, then a
     "<provider>::<model>" prefix, then DEFAULT_PROVIDER.
+
+    Pass `meta` to learn which provider actually answered — on an 'auto' walk
+    that is not knowable from the outside, and a silent fallback otherwise looks
+    identical to a first-choice success.
     """
     if "::" in model:
         head, tail = model.split("::", 1)
@@ -349,7 +425,7 @@ def route(model: str, body: dict, provider: str | None = None):
         for candidate in chain:
             m = (model if model and model not in ("default", "auto")
                  else FALLBACK_MODEL.get(candidate, model or "default"))
-            status, payload = call_upstream(candidate, m, body)
+            status, payload = call_upstream(candidate, m, body, meta=meta)
             if status == 200:
                 if candidate != chain[0]:
                     log(f"AUTO  fell through to {candidate} ({m})")
@@ -360,10 +436,55 @@ def route(model: str, body: dict, provider: str | None = None):
     if provider is not None:
         if provider not in PROVIDERS:
             return 400, {"error": {"message": f"unknown provider '{provider}'"}}
-        return call_upstream(provider, model, body)
+        return call_upstream(provider, model, body, meta=meta)
 
     # Bare model name: use the default provider.
-    return call_upstream(DEFAULT_PROVIDER, model, body)
+    return call_upstream(DEFAULT_PROVIDER, model, body, meta=meta)
+
+
+def _trace_call(*, meta: dict, model: str, provider, status: int, latency_ms: int,
+                body: dict, payload: dict) -> None:
+    """Append one provenance record for a completed request.
+
+    Never raises. A broken trace store must not break a working gateway, so this
+    swallows everything -- the trade is that a silent tracing failure is possible,
+    which is why `ai_trace.py status` reports the record count.
+    """
+    try:
+        import ai_trace  # noqa: PLC0415  (beside this file; optional by design)
+    except Exception:
+        return
+    try:
+        usage = payload.get("usage") or {}
+        content = None
+        try:
+            content = payload["choices"][0]["message"]["content"]
+        except Exception:
+            pass
+        err = None
+        if status != 200:
+            detail = payload.get("error")
+            err = detail.get("message") if isinstance(detail, dict) else str(detail)[:300]
+        ai_trace.record(
+            provider=meta.get("provider") or provider or DEFAULT_PROVIDER,
+            model=meta.get("model") or model,
+            status=status,
+            latency_ms=latency_ms,
+            tokens={
+                "prompt": usage.get("prompt_tokens", 0),
+                "completion": usage.get("completion_tokens", 0),
+                "total": usage.get("total_tokens", 0),
+            },
+            prompt=body.get("messages") or body.get("prompt"),
+            response=content,
+            attempts=meta.get("attempts"),
+            key_tag=meta.get("key_tag"),
+            requested_provider=provider,
+            requested_model=model,
+            error=err,
+        )
+    except Exception:
+        pass
 
 
 def status() -> dict:
@@ -393,7 +514,8 @@ def probe_provider(provider: str) -> dict:
     can actually serve is the one it will actually be asked to serve.
 
     Cost: one prompt token per provider, per invocation.
-    States: live, rate-limited, unpaid, auth-dead, bad-model, unreachable, no-key.
+    States: live, rate-limited, unpaid, auth-dead, bad-model, upstream,
+    unreachable, no-key.
     """
     pool = pool_for(provider)
     if not pool:
@@ -426,7 +548,15 @@ def probe_provider(provider: str) -> dict:
             state = "unpaid"
         else:
             state = {401: "auth-dead", 402: "unpaid", 403: "auth-dead",
-                     404: "bad-model", 429: "rate-limited"}.get(
+                     404: "bad-model", 429: "rate-limited",
+                     # 5xx is the provider failing, not the key or the URL, so
+                     # it gets its own name instead of falling through to the
+                     # raw `http-503` that reads the same as an unrecognised
+                     # error. Verified 2026-09-16: gemini answers 503 and
+                     # sageox 502 against keys that authenticate fine, and a
+                     # transient outage is worth re-probing rather than
+                     # retiring the pool over.
+                     502: "upstream", 503: "upstream"}.get(
                          e.code, f"http-{e.code}")
         return {"provider": provider, "keys": len(pool), "state": state,
                 "http": e.code}
@@ -485,14 +615,20 @@ class Handler(BaseHTTPRequestHandler):
             self._send(400, {"error": {"message": "invalid JSON body"}})
             return
         model = str(body.get("model") or DEFAULT_PROVIDER)
-        code, payload = route(model, body, provider)
+        meta: dict = {}
+        started = time.time()
+        code, payload = route(model, body, provider, meta=meta)
+        latency_ms = int((time.time() - started) * 1000)
         # Every request leaves a trace: which provider actually answered, and
         # where a fallback happened. Without this the rotation is invisible and
         # a silent misroute looks identical to a working call.
-        log(f"REQ  path={self.path} provider={provider or DEFAULT_PROVIDER} "
-            f"model={model} -> {code}")
+        log(f"REQ  path={self.path} "
+            f"provider={meta.get('provider') or provider or DEFAULT_PROVIDER} "
+            f"model={model} -> {code} in {latency_ms}ms")
         if code == 200 and "usage" not in payload:
             payload["usage"] = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+        _trace_call(meta=meta, model=model, provider=provider, status=code,
+                    latency_ms=latency_ms, body=body, payload=payload)
         self._send(code, payload)
 
     def log_message(self, *_a):

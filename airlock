@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+# airlock — nothing leaves unsanitized. Redaction boundary.
+exec python3 "$HOME/tools/boundary/airlock.py" "$@"

@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+# cm — codemap no-copy needed
+python3 ~/tools/introspection/codemap.py "${1:-~/Official-Vertical-AI-Boardroom}" --out /tmp/cm.html && echo "→ /tmp/cm.html (but stats already above)"

@@ -1,0 +1,45 @@
+#!/usr/bin/env bash
+# hy4 — Tencent Hunyuan Hy4 Preview via OpenRouter (1M context).
+# Keys come from the concierge vault at runtime; nothing persisted.
+# Usage: hy4 "your prompt"   |   echo "prompt" | hy4   |   hy4 --model <slug> "prompt"
+# Slug: tencent/hy4-preview (default), also: tencent/hunyuan-a13b-instruct
+# NOTE: paid model — requires credits on the OpenRouter account behind the vault key.
+. "$HOME/bin/vault-env" >/dev/null 2>&1
+exec /usr/bin/python3 - "$@" <<'EOF'
+import json, os, sys, urllib.request, urllib.error
+
+args = sys.argv[1:]
+model = "tencent/hy4-preview"
+if args and args[0] == "--model":
+    model = args[1]; args = args[2:]
+prompt = " ".join(args) if args else sys.stdin.read().strip()
+if not prompt:
+    print("usage: hy4 [--model <slug>] \"prompt\"  (or pipe prompt on stdin)", file=sys.stderr)
+    sys.exit(2)
+
+keys = [k.strip() for k in os.environ.get(
+    "OPENROUTER_API_KEY_POOL", os.environ.get("OPENROUTER_API_KEY", "")).split(",") if k.strip()]
+if not keys:
+    print("no OpenRouter key in vault env (vault-env export failed?)", file=sys.stderr)
+    sys.exit(1)
+
+body = json.dumps({"model": model, "messages": [{"role": "user", "content": prompt}]}).encode()
+for i, key in enumerate(keys):
+    req = urllib.request.Request("https://openrouter.ai/api/v1/chat/completions",
+        data=body, headers={"Authorization": f"Bearer {key}",
+            "Content-Type": "application/json", "User-Agent": "ox/1.0"})
+    try:
+        resp = json.load(urllib.request.urlopen(req, timeout=120))
+        print(resp["choices"][0]["message"]["content"])
+        sys.exit(0)
+    except urllib.error.HTTPError as e:
+        detail = e.read().decode()[:200]
+        print(f"[key{i} ...{key[-4:]}] HTTP {e.code}: {detail}", file=sys.stderr)
+        if e.code == 401 or e.code == 403:
+            continue          # dead key, try next
+        if e.code == 402:
+            break             # credits — same account tier for all, retrying won't help
+    except Exception as e:
+        print(f"[key{i} ...{key[-4:]}] {type(e).__name__}: {e}", file=sys.stderr)
+sys.exit(1)
+EOF

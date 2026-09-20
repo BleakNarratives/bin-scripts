@@ -1,4 +1,15 @@
 #!/usr/bin/env python3
+
+# [DNA_TAG]
+# ORIGIN: Crostini-Chromebook
+# PILLAR: armory
+# DEPS: os,sys
+# ROLE: Thin wrapper ensuring GEMINI_API_KEY loads from vault
+# AUTHOR: Bleak
+# SESSION: 2026-09-11
+# TIER: 4
+# [/DNA_TAG]
+
 """
 gemini_cli — thin wrapper that ensures GEMINI_API_KEY is loaded from vault
 before delegating to the system `gemini` CLI.

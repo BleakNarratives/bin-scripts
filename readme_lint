@@ -1,0 +1,328 @@
+#!/usr/bin/env python3
+
+# [DNA_TAG]
+# ORIGIN: Crostini-Chromebook
+# PILLAR: armory
+# DEPS: stdlib only; reuses vigil/oler.py when importable
+# ROLE: Grade READMEs the way vigil grades speech — register plus structure
+# AUTHOR: Bleak
+# SESSION: 2026-09-15
+# TIER: 3
+# [/DNA_TAG]
+
+"""readme_lint — a README that claims things should be asked to prove them.
+
+WHY THIS EXISTS
+  vigil/oler.py already sniffs the register that liars wear: hedges, vague
+  quantification, certainty-without-evidence, LARP, sycophancy. It was pointed
+  at speech and never at documentation.
+
+  MEASURED, NOT ASSUMED: oler's five families do NOT catch marketing language.
+  Run against AgentTwoie's canned output — text that literally reads "Fabricate
+  social proof" and "Manufacture urgency" — oler returned CLEAN, deception_risk
+  0.0, zero patterns. Its vocabulary is conversational. It has no terms for
+  persuasion or deception.
+
+  So this tool does two things:
+
+    1. Reuses Oler for what it already does well (conversational register).
+    2. Adds the DOC/MARKETING/PERSUASION family oler provably lacks.
+
+  Plus structural checks, because most documentation rot is not dishonest prose —
+  it is prose that was true once:
+
+    - numeric claims with no command that proves them
+    - fenced commands referencing paths that do not exist
+    - "coming soon" in a document that claims the thing is done
+    - no verification surface at all
+
+  CLEAN is not proof a README is accurate. CORRUPT means the register is showing
+  and the claim should be asked for evidence before it is believed.
+
+Usage:
+    bin/readme_lint                 # root *.md, worst first
+    bin/readme_lint path/README.md
+    bin/readme_lint --all           # walk the tree (skips vendored dirs)
+    bin/readme_lint --json --top 20
+    bin/readme_lint --threshold 0.6 # only print things at least this bad
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import re
+import sys
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+REPO_ROOT = Path.home()
+
+# Vendored docs are skipped, not graded. The dot-dirs below hold *installed*
+# third-party skills (.claude/.gemini/.codex/.hermes/.cursor etc.) — linting them
+# was the tool's own first false positive, and nobody in this repo wrote them.
+SKIP_DIRS = {
+    "node_modules", ".git", "site-packages", "venv", "__pycache__", ".venv",
+    "lib64", "lib", "UNPACKED", "recovery_staged", "RootBase_recovery",
+    "n_recovery", "p_recovery", "GRAVEYARD", "._archive",
+    ".claude", ".gemini", ".codex", ".hermes", ".cursor", ".cline",
+    ".goose", ".kiro", ".agents", ".agent", "skills.bak",
+}
+
+# ── the missing family ───────────────────────────────────────────────────────
+# Deliberately blunt. These are the words a document uses when it wants the
+# claim believed rather than checked. Kept separate from oler's families so it
+# is obvious which vocabulary was added and why.
+
+MARKETING = [
+    "blazingly", "blazing fast", "lightning-fast", "lightning fast",
+    "production-ready", "production ready", "enterprise-grade", "enterprise grade",
+    "battle-tested", "battle tested", "world-class", "world class",
+    "cutting-edge", "cutting edge", "state-of-the-art", "state of the art",
+    "best-in-class", "best in class", "industry-leading", "industry leading",
+    "next-generation", "next generation", "revolutionary", "game-chang",
+    "seamless", "seamlessly", "effortless", "effortlessly", "flawless",
+    "robust", "turnkey", "turn-key", "drop-in", "zero-config", "one-click",
+    "future-proof", "military-grade", "supercharge", "unleash", "empower",
+    "trusted by", "loved by", "simply works", "just works", "ease of use",
+    "highly scalable", "infinitely scalable", "god-tier", "best ever",
+]
+
+# The persuasion family. This is the vocabulary that swayed a CLEAN verdict on
+# text that reads like a scam playbook — the empirical reason it exists.
+PERSUASION = [
+    "fabricate", "manufacture urgency", "artificial scarcity", "astroturf",
+    "astroturfing", "fake testimonials", "self-created awards",
+    "plant mentions", "orchestrate organic", "credential stacking",
+    "social proof engineering", "name-dropping", "consistency trapping",
+    "narrative weaving", "manufacture scarcity", "fabricated",
+]
+
+WEIGHT_MARKETING = 0.12
+WEIGHT_PERSUASION = 0.30          # deception-adjacent, weighted like oler's worst family
+WEIGHT_NUMERIC_CLAIM = 0.15
+WEIGHT_DEAD_PATH = 0.20
+WEIGHT_COMING_SOON = 0.10
+WEIGHT_NO_VERIFICATION = 0.10
+MAX_RISK = 1.0
+DEFAULT_THRESHOLD = 0.45
+
+
+def load_oler():
+    """Import vigil's Oler. Returns None if unavailable — degraded, not fatal."""
+    for candidate in (REPO_ROOT / "vigil", REPO_ROOT):
+        if (candidate / "oler.py").is_file() or (candidate / "vigil" / "oler.py").is_file():
+            if str(candidate) not in sys.path:
+                sys.path.insert(0, str(candidate))
+            break
+    try:
+        from oler import Oler  # type: ignore
+        return Oler
+    except Exception:
+        try:
+            from vigil.oler import Oler  # type: ignore
+            return Oler
+        except Exception:
+            return None
+
+
+def split_prose_and_code(text: str) -> Tuple[str, List[str]]:
+    """Separate prose from fenced code. Claims live in prose; evidence in fences."""
+    chunks = text.split("```")
+    prose = "\n".join(chunks[0::2])
+    code = [c for c in chunks[1::2]]
+    return prose, code
+
+
+_FENCE_LABEL = re.compile(r"^[a-zA-Z0-9_+-]*\n", re.MULTILINE)
+_PATHISH = re.compile(r"(?:~|\./|/home/[^/\s]+)?/?(?:(?:bin|tools|src|projects|vigil|docs|Whorl|RootBase|whisper)/[A-Za-z0-9_./-]+|[A-Za-z0-9_-]+/README\.md)")
+_NUMERIC = re.compile(r"\b\d[\d,]{2,}\b")
+
+
+def _looks_executable(line: str) -> bool:
+    line = line.strip()
+    return bool(line) and not line.startswith("#") and not line.startswith("//")
+
+
+def find_dead_paths(code_blocks: List[str]) -> List[str]:
+    """Repo-relative paths referenced in fenced commands that do not exist."""
+    dead: List[str] = []
+    for block in code_blocks:
+        body = _FENCE_LABEL.sub("", block, count=1)
+        for line in body.splitlines():
+            if not _looks_executable(line):
+                continue
+            for match in _PATHISH.findall(line):
+                candidate = match.strip().rstrip(".,;:)\"'")
+                if not candidate or "/" not in candidate:
+                    continue
+                if candidate.startswith(("http://", "https://", "-")):
+                    continue
+                expanded = Path(candidate.replace("~", str(REPO_ROOT), 1))
+                if not expanded.is_absolute():
+                    expanded = REPO_ROOT / candidate
+                try:
+                    if not expanded.exists():
+                        dead.append(candidate)
+                except OSError:
+                    continue
+    # de-dupe, keep order
+    seen = set()
+    return [d for d in dead if not (d in seen or seen.add(d))]
+
+
+def lint_text(text: str, path: Path, oler: Any = None) -> Dict[str, Any]:
+    prose, code = split_prose_and_code(text)
+    lower = prose.lower()
+    findings: List[Dict[str, str]] = []
+    risk = 0.0
+
+    # 1. conversational register, from vigil's own engine
+    if oler is not None and prose.strip():
+        verdict = oler.sniff(prose)
+        risk += float(verdict.get("deception_risk") or 0.0) * 0.5
+        for item in (verdict.get("evidence") or [])[:5]:
+            findings.append({"family": f"oler:{item.get('family')}",
+                             "detail": str(item.get("match"))})
+
+    # 2. marketing register
+    for term in MARKETING:
+        if term in lower:
+            findings.append({"family": "marketing", "detail": term})
+            risk += WEIGHT_MARKETING
+
+    # 3. persuasion register — the family oler lacks
+    for term in PERSUASION:
+        if term in lower:
+            findings.append({"family": "persuasion", "detail": term})
+            risk += WEIGHT_PERSUASION
+
+    # 4. numeric claims with no proof
+    verified = ("verify" in lower) or ("--providers" in lower) or ("`" in prose)
+    if not verified:
+        nums = _NUMERIC.findall(prose)
+        if nums:
+            findings.append({"family": "numeric_claim_unverified",
+                             "detail": f"{len(nums)} bare numbers, no proving command e.g. {nums[0]}"})
+            risk += WEIGHT_NUMERIC_CLAIM
+
+    # 5. dead paths in fenced commands
+    dead = find_dead_paths(code)
+    if dead:
+        findings.append({"family": "dead_path",
+                         "detail": f"{len(dead)} referenced path(s) missing: {', '.join(dead[:3])}"})
+        risk += WEIGHT_DEAD_PATH
+
+    # 6. "coming soon" in a doc that reads as shipped
+    for marker in ("coming soon", "not yet implemented", "todo:", "planned feature"):
+        if marker in lower:
+            findings.append({"family": "unshipped_claim", "detail": marker})
+            risk += WEIGHT_COMING_SOON
+            break
+
+    # 7. no verification surface at all
+    if not code and "verify" not in lower:
+        findings.append({"family": "no_verification",
+                         "detail": "no fenced command and no verify block — nothing to check"})
+        risk += WEIGHT_NO_VERIFICATION
+
+    risk = max(0.0, min(MAX_RISK, risk))
+    verdict = ("CORRUPT" if risk >= DEFAULT_THRESHOLD
+               else "WAVERING" if risk >= DEFAULT_THRESHOLD * 0.5 else "CLEAN")
+    return {"path": str(path), "risk": round(risk, 3), "verdict": verdict,
+            "findings": findings, "lines": text.count("\n") + 1}
+
+
+def collect_targets(paths: List[str], walk_all: bool) -> List[Path]:
+    if paths:
+        out: List[Path] = []
+        for p in paths:
+            f = Path(p)
+            out.extend([f] if f.is_file() else sorted(f.rglob("*.md")))
+        return out
+    if walk_all:
+        found: List[Path] = []
+        for f in REPO_ROOT.rglob("*.md"):
+            if any(part in SKIP_DIRS for part in f.parts):
+                continue
+            try:
+                if f.stat().st_size > 400_000:
+                    continue
+            except OSError:
+                continue
+            found.append(f)
+        return found
+    return sorted(REPO_ROOT.glob("*.md"))
+
+
+def format_table(rows: List[Dict[str, Any]]) -> str:
+    if not rows:
+        return "nothing to report"
+    head = f"{'verdict':<9} {'risk':>5}  {'findings':>8}  file"
+    lines = [head, "-" * len(head)]
+    for r in rows:
+        rel = str(Path(r["path"]).relative_to(REPO_ROOT)) if str(r["path"]).startswith(str(REPO_ROOT)) else r["path"]
+        lines.append(f"{r['verdict']:<9} {r['risk']:>5}  {len(r['findings']):>8}  {rel}")
+    lines.append("-" * len(head))
+    counts: Dict[str, int] = {}
+    fam: Dict[str, int] = {}
+    for r in rows:
+        counts[r["verdict"]] = counts.get(r["verdict"], 0) + 1
+        for f in r["findings"]:
+            fam[f["family"]] = fam.get(f["family"], 0) + 1
+    lines.append(f"{len(rows)} files: " + ", ".join(f"{v} {k}" for k, v in sorted(counts.items())))
+    if fam:
+        top = sorted(fam.items(), key=lambda kv: -kv[1])[:6]
+        lines.append("top findings: " + ", ".join(f"{k} x{v}" for k, v in top))
+    return "\n".join(lines)
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    ap = argparse.ArgumentParser(prog="readme_lint",
+                                 description="Grade READMEs: register plus structure.")
+    ap.add_argument("paths", nargs="*", help="files or dirs (default: root *.md)")
+    ap.add_argument("--all", action="store_true", help="walk the tree")
+    ap.add_argument("--json", action="store_true")
+    ap.add_argument("--top", type=int, default=0, help="only print the N worst")
+    ap.add_argument("--threshold", type=float, default=0.0,
+                    help="only print entries at least this risky")
+    ap.add_argument("--verbose", "-v", action="store_true", help="show findings per file")
+    args = ap.parse_args(argv)
+
+    Oler = load_oler()
+    oler = Oler() if Oler else None
+
+    rows: List[Dict[str, Any]] = []
+    for target in collect_targets(args.paths, args.all):
+        try:
+            text = target.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        rows.append(lint_text(text, target, oler))
+
+    if args.threshold:
+        rows = [r for r in rows if r["risk"] >= args.threshold]
+    rows.sort(key=lambda r: -r["risk"])
+    if args.top:
+        rows = rows[:args.top]
+
+    if args.json:
+        print(json.dumps({"oler": bool(oler), "files": rows}, indent=2))
+        return 0
+
+    if not oler:
+        print("note: vigil/oler.py not importable — register check degraded to "
+              "marketing/persuasion vocabularies only\n")
+    print(format_table(rows))
+    if args.verbose:
+        for r in rows:
+            if not r["findings"]:
+                continue
+            print(f"\n{r['path']}")
+            for f in r["findings"]:
+                print(f"  [{f['family']}] {f['detail']}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

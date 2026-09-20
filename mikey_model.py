@@ -1,4 +1,15 @@
 #!/usr/bin/env python3
+
+# [DNA_TAG]
+# ORIGIN: Crostini-Chromebook
+# PILLAR: swarm
+# DEPS: json,os,subprocess,sys
+# ROLE: Self-contained survival stack for Bleak Narratives
+# AUTHOR: Bleak
+# SESSION: 2026-09-11
+# TIER: 3
+# [/DNA_TAG]
+
 """
 MIKEY_MODEL - Self-contained survival stack for Bleak Narratives.
 CLI: start | status | charge <amount> [user] | round | hook <payload>

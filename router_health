@@ -1,0 +1,132 @@
+#!/usr/bin/env python3
+
+# [DNA_TAG]
+# ORIGIN: Crostini-Chromebook
+# PILLAR: armory
+# DEPS: stdlib only; calls systemctl --user
+# ROLE: Keep 9router actually serving, not merely resident — detects the zombie state and restarts it
+# AUTHOR: Buffy
+# SESSION: 2026-09-15
+# TIER: 3
+# [/DNA_TAG]
+
+"""router_health — the difference between "running" and "serving".
+
+WHY THIS EXISTS
+  9router fails in the worst possible way: the process stays resident, `pgrep`
+  finds it, `systemctl status` says active -- and the port is closed, so every
+  CLI pointed at it fails. It was caught in exactly that state on 2026-09-15
+  (pid alive, port 20128 closed) while the web dashboard still looked fine.
+
+  systemd's Restart=always does NOT cover this. It restarts on EXIT. A process
+  that is alive but not listening never exits, so it is never restarted. That is
+  the whole reason this file has to exist separately from the unit.
+
+  So the check is the PORT, never the process. That sentence is the entire point.
+
+Behaviour:
+  listening              -> exit 0, silent (safe on a tight timer)
+  process up, port shut  -> restart the unit, exit 1
+  nothing at all         -> start it if the unit exists, exit 1
+  no unit installed      -> exit 0 silently with a one-line note, because this
+                            script must not be the reason a fresh machine errors
+
+Usage:
+    bin/router_health            # check and repair
+    bin/router_health --dry-run  # report only, change nothing
+    bin/router_health --quiet    # print nothing unless it had to act
+"""
+
+from __future__ import annotations
+
+import argparse
+import subprocess
+import sys
+from pathlib import Path
+
+PORT = 20128
+UNIT = "9router.service"
+
+
+def listening(port: int) -> bool:
+    """Is anything LISTENing on this port? Procfs, so no packets are sent."""
+    for proc_file in ("/proc/net/tcp", "/proc/net/tcp6"):
+        try:
+            lines = Path(proc_file).read_text().splitlines()[1:]
+        except OSError:
+            continue
+        for line in lines:
+            fields = line.split()
+            if len(fields) < 4 or fields[3] != "0A":  # 0A is TCP_LISTEN
+                continue
+            try:
+                if int(fields[1].rsplit(":", 1)[1], 16) == port:
+                    return True
+            except (IndexError, ValueError):
+                continue
+    return False
+
+
+def unit_loaded(unit: str) -> bool:
+    try:
+        result = subprocess.run(
+            ["systemctl", "--user", "cat", unit],
+            capture_output=True, text=True, timeout=15)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return result.returncode == 0
+
+
+def systemctl(*args: str) -> bool:
+    """Run systemctl --user, returning whether it succeeded.
+
+    Never raises: a health check that crashes under pressure is worse than one
+    that reports it could not act.
+    """
+    try:
+        result = subprocess.run(
+            ["systemctl", "--user", *args],
+            capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return result.returncode == 0
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--quiet", action="store_true",
+                        help="say nothing unless action was needed")
+    args = parser.parse_args()
+
+    if listening(PORT):
+        if not args.quiet:
+            print(f"9router: listening on 127.0.0.1:{PORT}")
+        return 0
+
+    if not unit_loaded(UNIT):
+        # No unit on this machine. Say so once and leave with success, so the
+        # script is not the reason a fresh environment reports failures.
+        if not args.quiet:
+            print(f"9router: port {PORT} closed and {UNIT} is not installed "
+                  f"(nothing to restart)")
+        return 0
+
+    verb = "would restart" if args.dry_run else "restarting"
+    print(f"9router: NOT LISTENING on {PORT} — {verb} {UNIT}", file=sys.stderr)
+    if args.dry_run:
+        return 1
+    if systemctl("restart", UNIT):
+        if listening(PORT):
+            print(f"9router: recovered, now listening on {PORT}", file=sys.stderr)
+            return 1
+        print(f"9router: restarted but {PORT} still closed — check `journalctl "
+              f"--user -u {UNIT}`", file=sys.stderr)
+        return 1
+    print(f"9router: restart failed — check `systemctl --user status {UNIT}`",
+          file=sys.stderr)
+    return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

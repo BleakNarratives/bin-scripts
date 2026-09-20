@@ -1,4 +1,15 @@
 #!/usr/bin/env python3
+
+# [DNA_TAG]
+# ORIGIN: Crostini-Chromebook
+# PILLAR: armory
+# DEPS: os,sys
+# ROLE: Interactive puter session with vault pre-load and vibe presets
+# AUTHOR: Bleak
+# SESSION: 2026-09-11
+# TIER: 4
+# [/DNA_TAG]
+
 """
 vibe_cli — interactive puter session with vault pre-load and vibe presets.
 
@@ -31,6 +42,7 @@ def load_vault_env():
         "groq": "GROQ_API_KEY",
         "gemini": "GEMINI_API_KEY",
         "cerebras": "CEREBRAS_API_KEY",
+        "mistral": "MISTRAL_API_KEY",
         "zenmux": "ZENMUX_API_KEY",
         "orcarouter": "ORCAROUTER_API_KEY",
         "bazaar": "BAZAAR_API_KEY",
@@ -42,9 +54,15 @@ def load_vault_env():
         k = keys.get(provider, {}).get("key", "")
         if k and "PLACEHOLDER" not in k and k != "sk-test_key_placeholder":
             os.environ[envvar] = k
-    pool = v.get("keys_by_provider", {}).get("openrouter", [])
-    if pool:
-        os.environ["OPENROUTER_API_KEY_POOL"] = ",".join(pool)
+    # Every provider with a pool gets one, not just openrouter: the local
+    # rotating gateway (bin/ai_gateway.py) reads <PROVIDER>_API_KEY_POOL and
+    # round-robins on 429, which is the whole reason it exists.
+    for provider, keys in (v.get("keys_by_provider", {}) or {}).items():
+        if isinstance(keys, list) and keys:
+            os.environ[f"{provider.upper()}_API_KEY_POOL"] = ",".join(
+                k for k in keys if isinstance(k, str) and k)
+    # The gateway's own key is not a secret - it never leaves localhost.
+    os.environ.setdefault("AI_GATEWAY_KEY", "local-gateway")
 
 
 # ─── Load vault before anything else ─────────────────────────────────────────

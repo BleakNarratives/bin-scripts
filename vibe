@@ -1,0 +1,33 @@
+#!/usr/bin/env bash
+# --- THE CONCIERGE: Fixed Vibe Execution Wrapper ---
+
+VAULT_FILE="$HOME/.concierge/vault.json"
+
+if [ ! -f "$VAULT_FILE" ]; then
+    echo "[Concierge Error] Vault file not found at $VAULT_FILE" >&2
+    exit 1
+fi
+
+# 1. Clear conflicting provider keys so Vibe doesn't fall back to Groq
+unset GROQ_API_KEY
+unset OPENAI_API_KEY
+unset GEMINI_API_KEY
+unset GOOGLE_API_KEY
+
+# 2. Extract active OpenRouter key from vault
+OPENROUTER_KEY=$(jq -r '.keys.openrouter.key // empty' "$VAULT_FILE")
+
+if [ -z "$OPENROUTER_KEY" ]; then
+    echo "[Concierge Error] No valid OpenRouter key found in vault." >&2
+    exit 1
+fi
+
+# 3. Target real vibe binary
+REAL_VIBE="/home/bleaknarratives/.local/bin/vibe"
+
+# 4. Pass configuration via environment variables instead of CLI flags
+exec env \
+  OPENROUTER_API_KEY="$OPENROUTER_KEY" \
+  VIBE_PROVIDER="openrouter" \
+  VIBE_MODEL="openai/gpt-oss-120b" \
+  "$REAL_VIBE" "$@"

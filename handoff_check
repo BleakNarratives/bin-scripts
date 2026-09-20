@@ -1,0 +1,352 @@
+#!/usr/bin/env python3
+
+# [DNA_TAG]
+# ORIGIN: Crostini-Chromebook
+# PILLAR: armory
+# DEPS: stdlib only (tomllib on 3.11+)
+# ROLE: Executable assertions for the CLI-stack handoff — every fix from 2026-09-15 has a check that fails if it regresses
+# AUTHOR: Buffy
+# SESSION: 2026-09-15
+# TIER: 3
+# [/DNA_TAG]
+
+"""handoff_check — the handoff, as assertions instead of prose.
+
+WHY THIS EXISTS
+  Three handoff documents already sit in this repo, and the failure they share is
+  architectural, not editorial: they are NARRATIVE. Narration invites
+  reinterpretation. A later agent reads "do not widen scope", decides its case is
+  the exception, and sweeps 150 files. That is on the format, not the character
+  of the agent.
+
+  So this file converts the 2026-09-15 handoff into checks. Each check below is
+  a defect that was actually found and fixed that day, paired with the exact
+  condition that means it came back. If a future agent wants to know the state
+  of the CLI stack, the answer is a command, not a paragraph that can be
+  misread.
+
+  Read HANDOFF_20260915_CLI_STACK.md for the reasoning. Run this to find out
+  whether the reasoning still holds.
+
+Status meanings:
+  PASS  the fix is intact
+  FAIL  a fixed defect has regressed — do not proceed until this is triaged
+  WARN  a known, accepted gap. Something is wrong and the decision was made to
+        live with it. A WARN is not permission to fix it silently.
+  SKIP  check not applicable on this machine
+
+Exit code: 0 when nothing FAILs, 1 when something does.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+import subprocess
+import sys
+from pathlib import Path
+from typing import Callable, List, Optional, Tuple
+
+HOME = Path.home()
+CODEX_CFG = HOME / ".codex/config.toml"
+OPENCODE_CFG = HOME / ".config/opencode/opencode.json"
+GROK_CFG = HOME / ".grok/config.toml"
+BASH_ALIASES = HOME / ".bash_aliases"
+
+# Model ids proven to work through 9router by a real completion on 2026-09-15.
+VERIFIED_ROUTER_MODEL = "ag/gpt-oss-120b-medium"
+# Model id that makes opencode die with "a.includes is not a function". It is a
+# meta-model whose response shape opencode cannot parse. Never make it default.
+BROKEN_OPENCODE_MODEL = "freebie-stack"
+
+
+def listening_ports() -> set:
+    """LISTEN ports from procfs. No socket, no packets, safe on a timer."""
+    ports = set()
+    for proc_file in ("/proc/net/tcp", "/proc/net/tcp6"):
+        try:
+            lines = Path(proc_file).read_text().splitlines()[1:]
+        except OSError:
+            continue
+        for line in lines:
+            fields = line.split()
+            if len(fields) > 3 and fields[3] == "0A":
+                try:
+                    ports.add(int(fields[1].rsplit(":", 1)[1], 16))
+                except (IndexError, ValueError):
+                    continue
+    return ports
+
+
+def pid_for(pattern: str) -> Optional[int]:
+    """PID of a process whose cmdline matches, or None. Read-only."""
+    try:
+        out = subprocess.run(["pgrep", "-f", pattern], capture_output=True,
+                             text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    pids = [int(p) for p in out.stdout.split() if p.strip().isdigit()]
+    return pids[0] if pids else None
+
+
+def read(path: Path) -> str:
+    try:
+        return path.read_text(errors="replace")
+    except OSError:
+        return ""
+
+
+# ── checks ───────────────────────────────────────────────────────────────────
+# Each returns (status, detail). Order matters only for readability of output.
+
+def check_local_gateway() -> Tuple[str, str]:
+    """The key-rotating gateway should be up; it is what most CLIs prefer."""
+    if 7071 in listening_ports():
+        return "PASS", "ai-gateway listening on 127.0.0.1:7071"
+    return "WARN", ("ai-gateway is down. Tools needing only chat/completions are "
+                    "unwired until it is up: bin/gateway-ensure")
+
+
+def check_router_not_zombie() -> Tuple[str, str]:
+    """9router's specific failure mode: resident process, closed port.
+
+    This is the single most misleading state in the stack. `pgrep` says it is
+    running, so a casual check declares things fine, while every CLI pointed at
+    it fails. Check the PORT, never the process.
+    """
+    pid = pid_for("node.*9router")
+    up = 20128 in listening_ports()
+    if up:
+        return "PASS", "9router listening on 127.0.0.1:20128"
+    if pid:
+        return "FAIL", (f"9router is RESIDENT BUT NOT LISTENING (pid {pid}, port 20128 "
+                        f"closed). This is the state that looks healthy and is not. "
+                        f"Restart: setsid 9router -p 20128 -n --skip-update "
+                        f"--host 127.0.0.1 &")
+    return "FAIL", ("9router is not running at all. Every CLI needing the Responses "
+                    "API (codex) is dead without it.")
+
+
+def check_codex_wire_api() -> Tuple[str, str]:
+    """Codex >= 0.151 rejects wire_api = "chat" as a hard config error.
+
+    Regression this guards: someone "fixing" Codex by pointing it at the local
+    gateway, which serves chat/completions only and 404s /v1/responses.
+
+    PARSED, NOT GREPPED. The first version of this check regexed the raw file and
+    instantly produced a false FAIL against its own explanatory comment on line 1
+    ('wire_api = "chat" is a hard error'). A comment cannot be a defect, and only
+    a parse can tell the difference -- which is the same lesson this whole file
+    exists to encode, committed by the file itself on its first run.
+    """
+    text = read(CODEX_CFG)
+    if not text:
+        return "SKIP", "~/.codex/config.toml not present"
+    try:
+        import tomllib
+        data = tomllib.loads(text)
+    except Exception as exc:  # noqa: BLE001
+        return "FAIL", f"does not parse as TOML: {exc}"
+    providers = {name: spec for name, spec in (data.get("model_providers") or {}).items()
+                 if isinstance(spec, dict)}
+    bad = [name for name, spec in providers.items()
+           if str(spec.get("wire_api", "")).lower() == "chat"]
+    if bad:
+        return "FAIL", (f"provider(s) {', '.join(bad)} declare wire_api = \"chat\", which "
+                        f"Codex >= 0.151 rejects outright. It loads as a hard error and "
+                        f"no request is ever made. Only \"responses\" is accepted.")
+    active = data.get("model_provider")
+    active_api = str((providers.get(active) or {}).get("wire_api", "")).lower()
+    if active and active_api != "responses":
+        return "FAIL", (f"active provider '{active}' uses wire_api "
+                        f"'{active_api or 'unset'}'; 0.151 accepts only responses")
+    return "PASS", f"active provider '{active}' uses wire_api = responses"
+
+
+def check_codex_config_parses() -> Tuple[str, str]:
+    """The config must parse as TOML, and model_provider must resolve.
+
+    A dangling model_provider is invisible until runtime: Codex loads fine and
+    then fails on the first request.
+    """
+    text = read(CODEX_CFG)
+    if not text:
+        return "SKIP", "~/.codex/config.toml not present"
+    try:
+        import tomllib
+        data = tomllib.loads(text)
+    except Exception as exc:  # noqa: BLE001 - report any parse failure verbatim
+        return "FAIL", f"codex config does not parse as TOML: {exc}"
+    provider = data.get("model_provider")
+    known = set((data.get("model_providers") or {}).keys())
+    if provider and known and provider not in known:
+        return "FAIL", (f"model_provider = '{provider}' has no [model_providers.{provider}] "
+                        f"block; defined: {', '.join(sorted(known)) or 'none'}")
+    return "PASS", f"parses; model_provider '{provider}' resolves"
+
+
+def check_opencode_model() -> Tuple[str, str]:
+    """opencode must not default to the model whose shape it cannot parse."""
+    text = read(OPENCODE_CFG)
+    if not text:
+        return "SKIP", "opencode config not present"
+    try:
+        data = json.loads(text)
+    except ValueError as exc:
+        return "FAIL", f"opencode config is not valid JSON: {exc}"
+    model = str(data.get("model") or "")
+    if BROKEN_OPENCODE_MODEL in model:
+        return "FAIL", (f"opencode default model is '{model}', which fails with "
+                        f"'a.includes is not a function'. Use {VERIFIED_ROUTER_MODEL}.")
+    if VERIFIED_ROUTER_MODEL not in model:
+        return "WARN", f"opencode default model '{model}' is not the verified id"
+    return "PASS", f"opencode default model is {model}"
+
+
+def check_grok_model_placeholder() -> Tuple[str, str]:
+    """grok must not carry the literal 'provider/model-id' placeholder.
+
+    It shipped that way in the operator's draft config. grok accepts the file and
+    fails only when a request is made.
+    """
+    text = read(GROK_CFG)
+    if not text:
+        return "SKIP", "grok config not present"
+    if "provider/model-id" in text:
+        return "FAIL", ("grok config still contains the literal placeholder "
+                        "'provider/model-id'; every call will fail")
+    return "PASS", "grok model id is real, not the placeholder"
+
+
+def check_localhost_vs_loopback() -> Tuple[str, str]:
+    """Configs should use 127.0.0.1, not localhost.
+
+    9router is started with --host 127.0.0.1. Some clients resolve localhost to
+    ::1 first and fail to connect while the server is perfectly healthy.
+    """
+    offenders = []
+    for path in (CODEX_CFG, GROK_CFG, OPENCODE_CFG):
+        if "localhost:20128" in read(path) or "localhost:7071" in read(path):
+            offenders.append(path.name)
+    if offenders:
+        return "WARN", (f"uses localhost instead of 127.0.0.1 in: {', '.join(offenders)} "
+                        f"(works today, fails on IPv6-first resolvers)")
+    return "PASS", "local hub URLs use 127.0.0.1"
+
+
+def check_gh_copilot_reachable() -> Tuple[str, str]:
+    """`gh` is aliased to a nap in .bash_aliases; copilot must pass through.
+
+    Regression this guards: collapsing the passthrough function back into the
+    plain alias. The extension would be installed and still unreachable.
+    """
+    text = read(BASH_ALIASES)
+    if not text:
+        return "SKIP", ".bash_aliases not present"
+    if 'command gh "$@"' in text and "gh() {" in text:
+        return "PASS", "gh() passes copilot through to the real gh"
+    if re.search(r"^alias gh=", text, re.M):
+        return "FAIL", ("`gh` is a plain alias again, so `gh copilot` prints the nap "
+                        "message and exits non-zero. The extension exists but cannot "
+                        "be invoked.")
+    return "WARN", "no gh nap alias found; check whether it was removed intentionally"
+
+
+def check_unwired() -> Tuple[str, str]:
+    """Delegate the 'is anything unwired' question to cli_onboard."""
+    script = HOME / "bin/cli_onboard"
+    if not script.is_file():
+        return "SKIP", "bin/cli_onboard not present"
+    try:
+        # --no-state keeps this check pure: a read-only assertion must not mutate
+        # the onboarding state file as a side effect of being asked.
+        out = subprocess.run([sys.executable, str(script), "--json", "--no-state"],
+                             capture_output=True, text=True, timeout=90)
+        rows = json.loads(out.stdout)
+    except Exception as exc:  # noqa: BLE001
+        return "WARN", f"cli_onboard could not be interpreted: {exc}"
+    blocked = [r["name"] for r in rows
+               if r.get("installed") and r.get("needs") and not r.get("hub")]
+    if blocked:
+        return "FAIL", f"installed but cannot reach a usable hub: {', '.join(blocked)}"
+    return "PASS", "every installed CLI with a base_url can reach a compatible hub"
+
+
+def check_known_ingest_gap() -> Tuple[str, str]:
+    """KNOWN GAP, deliberately not fixed: some drop-box keys still cannot land.
+
+    vault_ingest.classify_key() returns None for the tokenrouter / ofox.ai /
+    9router key shapes, and the caller then silently continues. --direct-key also
+    refuses an unclassified prefix, so those keys have NO ingest path at all.
+    Recorded as WARN because it was a conscious deferral, not an oversight.
+    """
+    text = read(HOME / "bin/vault_ingest.py")
+    if not text:
+        return "SKIP", "bin/vault_ingest.py not present"
+    for marker in ("sk-aabe1d3e98291997-", "sk-of-"):
+        if marker in text:
+            return "PASS", "prefix rules for the new provider shapes now exist"
+    return "WARN", ("tokenrouter / ofox.ai / 9router keys still have no classify rule, "
+                    "so they are silently dropped. --direct-key refuses them too.")
+
+
+def check_dead_codex_duplicate() -> Tuple[str, str]:
+    """~/.codex.config.toml is dead weight: Codex never reads it.
+
+    CODEX_HOME is unset, so Codex reads ~/.codex/config.toml only. That file also
+    repeats its provider block four times. Deleting it needs the operator's say-so
+    (repo rule: no deletions without authorization), hence WARN.
+    """
+    path = HOME / ".codex.config.toml"
+    if not path.is_file():
+        return "PASS", "the stale duplicate is gone"
+    count = read(path).count("model_providers.9router")
+    return "WARN", (f"{path.name} exists with {count} copies of its provider block. "
+                    f"Codex does not read it (CODEX_HOME is unset). Awaiting "
+                    f"authorization to delete.")
+
+
+CHECKS: List[Tuple[str, Callable[[], Tuple[str, str]]]] = [
+    ("local gateway up", check_local_gateway),
+    ("9router not a zombie", check_router_not_zombie),
+    ("codex wire_api valid", check_codex_wire_api),
+    ("codex config parses", check_codex_config_parses),
+    ("opencode model usable", check_opencode_model),
+    ("grok model not placeholder", check_grok_model_placeholder),
+    ("loopback not localhost", check_localhost_vs_loopback),
+    ("gh copilot reachable", check_gh_copilot_reachable),
+    ("nothing unwired", check_unwired),
+    ("known ingest gap", check_known_ingest_gap),
+    ("dead codex duplicate", check_dead_codex_duplicate),
+]
+
+
+def main() -> int:
+    width = max(len(name) for name, _ in CHECKS)
+    counts = {"PASS": 0, "FAIL": 0, "WARN": 0, "SKIP": 0}
+    failures: List[Tuple[str, str]] = []
+    print("HANDOFF CHECK — the 2026-09-15 CLI-stack fixes, asserted")
+    print("=" * 78)
+    for name, fn in CHECKS:
+        try:
+            status, detail = fn()
+        except Exception as exc:  # noqa: BLE001 - a broken check must not hide the rest
+            status, detail = "WARN", f"check raised {type(exc).__name__}: {exc}"
+        counts[status] = counts.get(status, 0) + 1
+        print(f"  [{status}] {name:<{width}}  {detail}")
+        if status == "FAIL":
+            failures.append((name, detail))
+    print("-" * 78)
+    print(f"  {counts['PASS']} pass · {counts['FAIL']} fail · "
+          f"{counts['WARN']} warn · {counts['SKIP']} skip")
+    if failures:
+        print("\n  FAILURES MEAN A FIX FROM 2026-09-15 CAME BACK:")
+        for name, detail in failures:
+            print(f"    * {name}: {detail}")
+        print("\n  Read HANDOFF_20260915_CLI_STACK.md before changing anything.")
+    return 1 if failures else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

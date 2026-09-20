@@ -1,0 +1,378 @@
+#!/usr/bin/env python3
+"""
+[DNA_TAG]
+ORIGIN: BleakNarratives/fox
+PILLAR: cli-tools
+PATH: ~/bin/fox
+LAST_SYNC: 2026-09-07
+[/DNA_TAG]
+
+fox — our own OpenRouter chat TUI. Stdlib only, vault-keyed, streaming.
+
+Usage:
+  fox                              # interactive chat (default model)
+  fox -m <model> "prompt"          # one-shot
+  cat file.py | fox "explain"      # piped context
+  fox --models [filter]            # live free catalog
+  fox --model-info <id>            # one model's details
+
+Interactive slash commands:
+  /models [filter]   list OpenRouter models (default: free-only)
+  /model <id>        switch model (tab-free; use /models to browse)
+  /free              list free models only
+  /system <text>     set/replace the system prompt ("" clears)
+  /new               wipe conversation history
+  /save [name]       save transcript to ~/.fox_transcripts/
+  /key               show which pool key is active
+  /help, /quit
+
+Keys: OPENROUTER_API_KEY / OPENROUTER_API_KEY_POOL from the concierge vault
+(source ~/bin/vault-env first, or run through ~/bin/vault-launch). Rotation
+on 401/403/429 across the pool. Nothing is persisted to disk but transcripts
+you explicitly /save.
+"""
+
+import json
+import os
+import re
+import sys
+import time
+import urllib.error
+import urllib.request
+from datetime import datetime
+from pathlib import Path
+
+VERSION = "1.0.0"
+API = "https://openrouter.ai/api/v1"
+MODELS_CACHE = Path.home() / ".cache" / "fox_models.json"
+CACHE_TTL = 3600  # seconds
+MAX_HISTORY_MSGS = 60          # rolling context guard
+DEFAULT_MODEL = os.environ.get("FOX_MODEL", "nvidia/nemotron-3-super-120b-a12b:free")
+HISTORY_CAP = 1200             # chars per stored message in transcript
+
+# Design system: dark bg assumed; gold primary, crimson alert, steel info. No emojis.
+GOLD = "\033[38;5;179m"
+CREAM = "\033[38;5;223m"
+CRIMSON = "\033[38;5;167m"
+STEEL = "\033[38;5;110m"
+DIM = "\033[2m"
+BOLD = "\033[1m"
+RESET = "\033[0m"
+
+MODEL_RE = re.compile(r"^[\w.\-]+/[\w.\-]+(:[\w\-]+)?$")
+
+
+def c(color, text):
+    return f"{color}{text}{RESET}"
+
+
+# ─── keys / rotation ────────────────────────────────────────
+
+def load_keys():
+    pool = [k.strip() for k in
+            os.environ.get("OPENROUTER_API_KEY_POOL",
+                           os.environ.get("OPENROUTER_API_KEY", "")).split(",")
+            if k.strip()]
+    if not pool:
+        print(c(CRIMSON, "no OpenRouter key in env — source ~/bin/vault-env or use vault-launch"),
+              file=sys.stderr)
+        sys.exit(1)
+    return pool
+
+
+class KeyPool:
+    def __init__(self):
+        self.keys = load_keys()
+        self.idx = 0
+
+    def current(self):
+        return self.keys[self.idx]
+
+    def rotate(self, reason=""):
+        self.idx = (self.idx + 1) % len(self.keys)
+        if reason:
+            print(c(DIM, f"  [pool] rotated to key ...{self.current()[-4:]} ({reason})"),
+                  file=sys.stderr)
+        if self.idx == 0 and len(self.keys) == 1:
+            return False
+        return True
+
+    @property
+    def single(self):
+        return len(self.keys) == 1
+
+
+# ─── catalog ────────────────────────────────────────────────
+
+def fetch_catalog(force=False):
+    """Live model list with a 1h disk cache. Returns list of model dicts."""
+    if not force and MODELS_CACHE.exists():
+        age = time.time() - MODELS_CACHE.stat().st_mtime
+        if age < CACHE_TTL:
+            try:
+                return json.loads(MODELS_CACHE.read_text())
+            except Exception:
+                pass
+    req = urllib.request.Request(f"{API}/models", headers={"User-Agent": "fox/1.0"})
+    data = json.load(urllib.request.urlopen(req, timeout=20))
+    models = data.get("data", [])
+    MODELS_CACHE.parent.mkdir(parents=True, exist_ok=True)
+    MODELS_CACHE.write_text(json.dumps(models))
+    return models
+
+
+def free_models(catalog, filt=""):
+    out = []
+    for m in catalog:
+        p = m.get("pricing", {})
+        if p.get("prompt") == "0" and p.get("completion") == "0":
+            if filt and filt.lower() not in m.get("id", "").lower():
+                continue
+            out.append(m)
+    out.sort(key=lambda m: -(m.get("context_length") or 0))
+    return out
+
+
+def print_models(models, note=""):
+    print(c(GOLD, f"  {len(models)} models{(' matching ' + note) if note else ''}"
+          f"{c(DIM, ' (ctx)')}:"))
+    for m in models[:40]:
+        ctx = m.get("context_length") or 0
+        print(f"    {c(CREAM, m['id']):<52} {c(DIM, f'{ctx:>9,}')}")
+    if len(models) > 40:
+        print(c(DIM, f"    ... {len(models) - 40} more (narrow the filter)"))
+
+
+# ─── inference ──────────────────────────────────────────────
+
+def stream_chat(pool, model, messages, on_delta):
+    """Stream a completion; returns (full_text, finish_reason). Rotates keys."""
+    body = json.dumps({"model": model, "messages": messages, "stream": True}).encode()
+    last_err = None
+    for attempt in range(len(pool.keys) + 1):
+        req = urllib.request.Request(
+            f"{API}/chat/completions", data=body,
+            headers={"Authorization": f"Bearer {pool.current()}",
+                     "Content-Type": "application/json",
+                     "User-Agent": "fox/1.0",
+                     "HTTP-Referer": "https://github.com/BleakNarratives",
+                     "X-Title": "fox"})
+        try:
+            resp = urllib.request.urlopen(req, timeout=180)
+            full, finish = [], "stop"
+            for raw in resp:
+                line = raw.decode("utf-8", "replace").strip()
+                if not line.startswith("data:"):
+                    continue
+                payload = line[5:].strip()
+                if payload == "[DONE]":
+                    break
+                try:
+                    chunk = json.loads(payload)
+                except json.JSONDecodeError:
+                    continue
+                delta = (chunk.get("choices") or [{}])[0]
+                piece = (delta.get("delta") or {}).get("content")
+                if piece:
+                    on_delta(piece)
+                    full.append(piece)
+                if delta.get("finish_reason"):
+                    finish = delta["finish_reason"]
+            return "".join(full), finish
+        except urllib.error.HTTPError as e:
+            err = e.read().decode()[:160]
+            last_err = f"HTTP {e.code}: {err}"
+            if e.code in (401, 403, 429) and not pool.single:
+                pool.rotate(f"{e.code}")
+                continue
+            break
+        except Exception as e:
+            last_err = f"{type(e).__name__}: {str(e)[:120]}"
+            break
+    raise RuntimeError(last_err or "request failed")
+
+
+# ─── transcript persistence ─────────────────────────────────
+
+TRANSCRIPTS = Path.home() / ".fox_transcripts"
+
+
+def save_transcript(model, messages):
+    TRANSCRIPTS.mkdir(exist_ok=True)
+    name = datetime.now().strftime("%Y%m%d_%H%M%S")
+    path = TRANSCRIPTS / f"{name}.json"
+    path.write_text(json.dumps(
+        {"model": model, "saved_at": datetime.now().isoformat(),
+         "messages": [{"role": m["role"],
+                       "content": m["content"][:HISTORY_CAP]} for m in messages]},
+        indent=2))
+    return path
+
+
+def export_intent(model, messages, topic):
+    """Export the session as an Implore grounding source + research intent.
+    Writes the transcript to ~/.fox_transcripts and prints an intent
+    JSON you can POST to the Implore /api/v1/research service with kb=true."""
+    path = save_transcript(model, messages)
+    intent = {
+        "topic": topic or model.split("/")[-1].split(":")[0].replace("-", " "),
+        "format": "report",
+        "audience": "general",
+        "depth": 3,
+        "max_words": 1500,
+        "kb": True,
+        "files": [str(path)],
+        "note": "fox session export — conversation used as a grounding source.",
+    }
+    return path, intent
+
+
+# ─── REPL ───────────────────────────────────────────────────
+
+BANNER = (
+    f"{GOLD}{BOLD}  \u250c\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2510{RESET}\n"
+    f"{GOLD}  \u2502  {CREAM}{BOLD}fox{RESET}{GOLD} \u2014 OpenRouter chat \u00b7 v{VERSION}  \u2502{RESET}\n"
+    f"{GOLD}  \u2514\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2518{RESET}"
+)
+
+
+def repl(model):
+    print(BANNER.lstrip("\n"))
+    pool = KeyPool()
+    print(c(DIM, f"  model: {model} · keys: {len(pool.keys)} · /help for commands\n"))
+    messages = []
+    while True:
+        try:
+            line = input(c(GOLD, "you ▸ ")).strip()
+        except (EOFError, KeyboardInterrupt):
+            print(c(DIM, "\n  bye."))
+            return
+        if not line:
+            continue
+        if line.startswith("/"):
+            cmd, _, arg = line.partition(" ")
+            cmd = cmd.lower()
+            if cmd in ("/quit", "/exit", "/q"):
+                print(c(DIM, "  bye."))
+                return
+            elif cmd == "/help":
+                print(c(CREAM, "  /models [f] /model <id> /free /system <t> /new /export /save /key /quit"))
+            elif cmd == "/key":
+                print(c(STEEL, f"  active key ...{pool.current()[-4:]} of {len(pool.keys)}"))
+            elif cmd == "/new":
+                messages = []
+                print(c(DIM, "  context cleared."))
+            elif cmd == "/free":
+                print_models(free_models(fetch_catalog()), note=arg.strip())
+            elif cmd == "/models":
+                cat = fetch_catalog()
+                if arg.strip():
+                    hits = [m for m in cat if arg.strip().lower() in m["id"].lower()]
+                else:
+                    hits = free_models(cat)
+                print_models(hits, note=arg.strip() or "free")
+            elif cmd == "/model":
+                if MODEL_RE.match(arg.strip()):
+                    model = arg.strip()
+                    print(c(GOLD, f"  model → {model}"))
+                else:
+                    print(c(CRIMSON, "  model id looks wrong (want provider/name[:tag])"))
+            elif cmd == "/system":
+                text = arg.strip()
+                messages = [m for m in messages if m["role"] != "system"]
+                if text:
+                    messages.insert(0, {"role": "system", "content": text})
+                print(c(DIM, "  system prompt set." if text else "  system prompt cleared."))
+            elif cmd == "/export":
+                p, intent = export_intent(model, messages, arg.strip())
+                print(c(GOLD, f"  transcript → {p}"))
+                print(c(STEEL, "  Implore intent (POST /api/v1/research with kb=true):"))
+                print(c(CREAM, json.dumps(intent, indent=2)))
+            elif cmd == "/save":
+                p = save_transcript(model, messages)
+                print(c(GOLD, f"  saved → {p}"))
+            else:
+                print(c(CRIMSON, f"  unknown command {cmd}"))
+            continue
+
+        messages.append({"role": "user", "content": line})
+        if len(messages) > MAX_HISTORY_MSGS:
+            # keep any system message + the tail
+            head = [m for m in messages if m["role"] == "system"][:1]
+            messages = head + messages[-(MAX_HISTORY_MSGS - 1):]
+
+        print(c(GOLD, "fox ▸ "), end="", flush=True)
+        try:
+            text, finish = stream_chat(pool, model, messages,
+                                       lambda p: sys.stdout.write(c(CREAM, p)) or sys.stdout.flush())
+            print()
+            if finish not in ("stop", "length"):
+                print(c(DIM, f"  [{finish}]"))
+            messages.append({"role": "assistant", "content": text})
+        except KeyboardInterrupt:
+            print(c(DIM, "\n  [interrupted]"))
+            messages.pop()
+        except RuntimeError as e:
+            print(c(CRIMSON, f"\n  error: {e}"))
+            messages.pop()
+        print()
+
+
+# ─── entry ──────────────────────────────────────────────────
+
+def main():
+    args = sys.argv[1:]
+    model = DEFAULT_MODEL
+    catalog_cmd = None
+    if "--models" in args:
+        catalog_cmd = "list"
+        args = [a for a in args if a != "--models"]
+    if "--free" in args:
+        catalog_cmd = "free"
+        args = [a for a in args if a != "--free"]
+    if "--model-info" in args:
+        idx = args.index("--model-info")
+        if idx + 1 < len(args):
+            mid = args[idx + 1]
+            cat = fetch_catalog(force=True)
+            for m in cat:
+                if m["id"] == mid:
+                    print(json.dumps(m, indent=2)[:2000])
+                    return
+            print(c(CRIMSON, f"  not found: {mid}"))
+            return
+    if "-m" in args:
+        idx = args.index("-m")
+        if idx + 1 < len(args):
+            model = args[idx + 1]
+            args = args[:idx] + args[idx + 2:]
+    elif "--model" in args:
+        idx = args.index("--model")
+        if idx + 1 < len(args):
+            model = args[idx + 1]
+            args = args[:idx] + args[idx + 2:]
+
+    if catalog_cmd:
+        cat = fetch_catalog(force=True)
+        print_models(free_models(cat) if catalog_cmd == "free" else cat)
+        return
+
+    prompt = " ".join(args).strip()
+    if not prompt and not sys.stdin.isatty():
+        prompt = sys.stdin.read().strip()
+    if prompt:
+        pool = KeyPool()
+        msgs = [{"role": "user", "content": prompt}]
+        try:
+            text, _ = stream_chat(pool, model, msgs,
+                                  lambda p: sys.stdout.write(p) or sys.stdout.flush())
+            print()
+        except RuntimeError as e:
+            print(c(CRIMSON, f"error: {e}"), file=sys.stderr)
+            sys.exit(1)
+        return
+    repl(model)
+
+
+if __name__ == "__main__":
+    main()

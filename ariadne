@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+# ariadne — the thread through the labyrinth. Persistent codebase index.
+exec python3 "$HOME/tools/introspection/ariadne.py" "$@"

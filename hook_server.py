@@ -1,4 +1,15 @@
 #!/usr/bin/env python3
+
+# [DNA_TAG]
+# ORIGIN: Crostini-Chromebook
+# PILLAR: armory
+# DEPS: http.server,json,os
+# ROLE: Hook server: listens on 9090, triggers rounds on POST /hook
+# AUTHOR: Bleak
+# SESSION: 2026-09-11
+# TIER: 3
+# [/DNA_TAG]
+
 """
 HOOK SERVER - Listens on port 9090, triggers rounds on POST /hook
 """

@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+# glob <id> — e.g., glob sherpa  (same as pooper --glob <id>, short)
+if [ $# -eq 0 ]; then exec python3 ~/tools/pooper/pooper.py --list; else exec python3 ~/tools/pooper/pooper.py --glob "$1" "${@:2}"; fi

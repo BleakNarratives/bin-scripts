@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# model_scout — one-place model availability board. Keys via concierge vault.
+. "$HOME/bin/vault-env" >/dev/null 2>&1
+exec /usr/bin/python3 "$HOME/bin/model_scout.py" "$@"

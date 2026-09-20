@@ -61,6 +61,42 @@ trace npm test             # auto-diagnose ONLY on failure
 matches the target file **exactly once**, and backs up first. Ambiguous patches
 are printed, never applied.
 
+### `ai_trace` — what actually happened on every call
+
+```bash
+python3 bin/ai_trace.py status             # capture mode + store location
+python3 bin/ai_trace.py summary --days 7   # per-provider tokens, latency, cost
+python3 bin/ai_trace.py redact < log.txt   # show what redaction does (stores nothing)
+```
+
+One JSONL record per gateway call in `~/.local/state/ai/traces/YYYY-MM-DD.jsonl`:
+which provider **actually answered** (not which was requested), model, status,
+latency, attempts, token counts, estimated cost, and a non-reversible key
+fingerprint.
+
+**Redaction runs on the way to disk, inside `record()`.** No code path writes raw
+prompt text. Prompt text here is untrusted input that routinely carries paths,
+emails and customer data, so the store is treated as a place personal data must
+not reach — not as a place to clean up afterwards. A trace already on disk cannot
+be un-leaked.
+
+Cost is honest by default: only free tiers price at `0.0`; anything else reports
+`unknown` rather than a guessed number. Add real rates under `[prices]` in
+`~/.config/ai/config.toml`.
+
+Traces deliberately do **not** reuse the gateway's `_tag()`, which reveals the
+first and last four characters of a key. Traces use a sha256 prefix instead.
+
+**STATUS: wired and recording.** Verified 2026-09-15: `ai_trace.py status`
+reports `records: 5` against the live store, and `ai --spend` prints the
+per-provider table — the same check caught a `swarms` call at 3687 ms, which
+matches a direct gateway measurement to the millisecond.
+
+This section previously claimed the opposite ("store is empty and `ai --spend`
+does not exist"). The correction is recorded rather than quietly dropped: a
+stale *not yet wired* note is how working tooling gets rebuilt by whoever reads
+it next.
+
 ### `anchor` — persistent-state agent
 
 ```bash
@@ -74,8 +110,19 @@ cat f.py | anchor "review this"
 ```
 
 State lives in SQLite at `~/.anchor/anchor.db` (messages, facts, tool_runs),
-so it survives across runs. Puter is retired — there is no `~/.puter_token`, so
-that bridge could only ever fail.
+so it survives across runs.
+
+Two corrections to this section (2026-09-15):
+
+- **Puter is not retired.** There is still no `~/.puter_token`, but three Puter
+auth tokens now live in the vault as the `puter` pool, and the gateway routes to
+them. The endpoint is `https://api.puter.com/puterai/openai/v1/chat/completions`
+with plain Bearer auth; the account currently answers `402 subscription
+required`.
+- **anchor no longer dies on bare invocation.** It used to `IndexError` on line
+one whenever stdin was not a TTY — i.e. under a pipe, cron, or another agent,
+which is exactly the headless case it exists for. In a terminal it printed usage
+and looked fine, which is why the crash stayed hidden.
 
 ### `keys` — the vault, one command
 
@@ -133,6 +180,26 @@ specifically because `/models` reports 200 for all three of those cases.
 - A provider that accepts a request and never answers is bounded by a
   per-attempt timeout.
 
+### Every vault pool has a route (2026-09-15)
+
+The vault held **14 pools** while `PROVIDERS` routed **8**, so six pools' keys
+arrived and were never read. All six are now wired with URLs verified live —
+each returned `200` from `GET /v1/models`, which proves the host *and* the key:
+
+| pool | state when wired |
+|---|---|
+| **swarms** | **live and free** — fronts 1908 model ids, 2.30–4.7 s, now second in `AUTO_CHAIN` |
+| bazaar | endpoint OK (`bazaarlink.ai`, not `bazaar.ai`) — 402, no credits |
+| orcarouter | endpoint OK — 429, free models need a linked GitHub account |
+| zenmux | endpoint OK — 403, key has no `payg` entitlement |
+| sageox | endpoint OK — 502, upstream temporarily unavailable (retryable) |
+| puter | endpoint OK — 402, subscription required |
+
+Two pools need no route because they are duplicates: `vibe` is **byte-identical**
+to `mistral`, and `jules` is a Google-key pool that was a superset of `gemini` —
+three of its usable keys were merged into `gemini`, taking that pool from **3
+keys to 6**. Evidence for every row: `docs/PROVIDER_ENDPOINTS.md`.
+
 ---
 
 ## Known limits
@@ -147,7 +214,7 @@ specifically because `/models` reports 200 for all three of those cases.
 
 ## Adding a provider
 
-Three places, all in `bin/ai_gateway.py` unless noted:
+Four places, all in `bin/ai_gateway.py` unless noted:
 
 1. `PROVIDERS` — the OpenAI-compatible chat URL.
 2. `FALLBACK_MODEL` — a model id it serves (a wrong id 404s and falls through).
@@ -155,3 +222,15 @@ Three places, all in `bin/ai_gateway.py` unless noted:
 4. `bin/vault-env` — the `<PROVIDER>_API_KEY` mapping so `keys on` exports it.
 
 A provider with no key is inert, so adding one early is harmless.
+
+---
+
+## Elsewhere in the stack
+
+- `~/projects/freebuff-lean/` — a **25 MB** line-oriented client over this same
+  gateway, measured against the shipping Freebuff client's ~436–566 MB and
+  45–80% CPU on this machine. See its `WHO_DID_WHAT.md` for the numbers.
+- `~/NEXT_STEPS.md` — the live work queue plus verified findings, so a future
+  session does not re-derive them.
+- `~/docs/PROVIDER_ENDPOINTS.md` — where to get keys and what each provider needs.
+- Ledgers for this directory: `bin/WHO_DID_WHAT.md`.

@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+# yank — timeout-safe clipboard for Crostini
+# usage: echo hi | yank   or   cat file | yank
+tmp=$(mktemp)
+cat > "$tmp"
+# wl-copy hangs on Crostini — timeout 1s or skip
+if command -v wl-copy >/dev/null 2>&1; then timeout 1 wl-copy < "$tmp" 2>/dev/null || true; fi
+if command -v xclip >/dev/null 2>&1; then timeout 1 xclip -selection clipboard < "$tmp" 2>/dev/null || true; fi
+chars=$(wc -c < "$tmp"); lines=$(wc -l < "$tmp")
+echo "[yank] ${chars}B ${lines}L — try paste with Ctrl+V; if still broken, just cat: cat $tmp" >&2
+# also leave it at /tmp/last_yank.txt so you never need clipboard
+cp "$tmp" /tmp/last_yank.txt
+rm -f "$tmp"

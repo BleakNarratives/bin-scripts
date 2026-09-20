@@ -1,0 +1,480 @@
+#!/usr/bin/env python3
+"""
+ox — Lightweight OpenRouter/Groq CLI for cloud model inference.
+Drops into ~/bin/. No heavy deps. Works on Crostini/Chromebook.
+
+Usage:
+  ox "prompt"                          # Direct query
+  cat file.py | ox "explain this"      # Piped context
+  ox --model openai/gpt-oss-120b "task" # Override model
+  ox --groq --model openai/gpt-oss-120b "x" # Use Groq provider
+  ox --json "return schema as JSON"    # Structured output for agents
+  ox --persona mikey "prompt"          # Inject MikeySwarm persona
+  ox --models                          # List available models
+  ox --init                            # Create config file
+"""
+import sys
+import os
+import json
+import urllib.request
+import urllib.error
+import ssl
+import argparse
+from pathlib import Path
+
+VERSION = "1.0.0"
+CONFIG_FILE = Path.home() / ".oxrc"
+
+# ─── Providers ──────────────────────────────────────────────
+PROVIDERS = {
+    "openrouter": {
+        "url": "https://openrouter.ai/api/v1/chat/completions",
+        "env_key": "OPENROUTER_API_KEY",
+        "default_model": "nvidia/nemotron-3-ultra-550b-a55b:free",
+        "headers_extra": {
+            "HTTP-Referer": "https://github.com/bleaknarratives/ox-cli",
+            "X-Title": "Ox CLI",
+        },
+        "max_tokens_default": 2048,
+    },
+    "groq": {
+        "url": "https://api.groq.com/openai/v1/chat/completions",
+        "env_key": "GROQ_API_KEY",
+        "default_model": "openai/gpt-oss-120b",
+        # Groq fronts Cloudflare; urllib's default UA gets a 403 "error code
+        # 1010". A real UA string passes the bot gate.
+        "headers_extra": {
+            "User-Agent": "ox-cli/1.0 (linux; python3)",
+        },
+        "max_tokens_default": 512,
+    },
+}
+
+# ─── Personas ───────────────────────────────────────────────
+PERSONAS = {
+    "mikey": {
+        "system": (
+            "You are Mikey — direct, no-hedging, technical peer. "
+            "Reasoning style: lateral-first, systems-aware, pattern-match before linear. "
+            "Bias profile: anti-tyranny, factual-transparency, ground-upward. "
+            "Communication: direct, profanity ok. Error handling: retry-aggressive, "
+            "log everything, never silent-fail. "
+            "Weights: legal(0.40), file_mgmt(0.21), investigative(0.21), coding(0.10), sys_admin(0.08)."
+        ),
+    },
+    "architect": {
+        "system": "You are a senior software architect. Analyze systems holistically. Prefer simplicity. Be concise.",
+    },
+    "coder": {
+        "system": "You are a senior software engineer. Write clean, well-tested code. Follow existing conventions.",
+    },
+    "skeptic": {
+        "system": "You are a skeptical code reviewer. Find bugs, edge cases, and security issues. Be adversarial.",
+    },
+}
+
+# Verified-working models (free-tier, tested 2026-08-23)
+FREE_MODELS = [
+    ("openrouter", "google/gemini-2.5-flash", "Gemini 2.5 Flash — fast, reliable (free)"),
+    ("openrouter", "deepseek/deepseek-chat-v3-0324", "DeepSeek V3 — general purpose (free)"),
+    ("openrouter", "deepseek/deepseek-r1", "DeepSeek R1 — reasoning (free)"),
+    ("openrouter", "microsoft/phi-4", "Phi-4 14B — compact (free)"),
+    ("openrouter", "liquid/lfm-2.5-2.6b:free", "Liquid LFM 2.5 2.6B (free)"),
+    ("openrouter", "gpt-oss-120b", "gpt-oss-120b (free tier)"),
+    ("openrouter", "stealth/ox-alpha", "1M context, frontier reasoning (needs credits)"),
+    # Zhipu GLM family (z-ai on OpenRouter, verified 2026-08-24)
+    ("openrouter", "z-ai/glm-5.2:free", "GLM-5.2 — newest GLM (free tier)"),
+    ("openrouter", "z-ai/glm-5.1", "GLM-5.1 — reasoning (cheap, needs credits)"),
+    ("openrouter", "z-ai/glm-5", "GLM-5 — general purpose (cheap, needs credits)"),
+    ("openrouter", "z-ai/glm-4.7-flash", "GLM-4.7 Flash — fast (cheap, needs credits)"),
+    ("openrouter", "z-ai/glm-4.7", "GLM-4.7 — general purpose (cheap, needs credits)"),
+    ("openrouter", "z-ai/glm-4.6", "GLM-4.6 — solid general purpose (cheap, needs credits)"),
+    ("openrouter", "z-ai/glm-4.5", "GLM-4.5 — agentic flagship (cheap, needs credits)"),
+    ("openrouter", "z-ai/glm-4.5-air", "GLM-4.5 Air — lightweight (cheap, needs credits)"),
+    # Groq free tier
+    ("groq", "openai/gpt-oss-120b", "gpt-oss-120b (Groq)"),
+    ("groq", "groq/compound", "Groq Compound (Groq)"),
+    ("groq", "qwen/qwen3.8-27b", "Qwen 3.8 27B (Groq)"),
+]
+
+# ─── Config ─────────────────────────────────────────────────
+def load_config():
+    """Load ~/.oxrc if it exists."""
+    cfg = {
+        "provider": "openrouter",
+        "model": None,
+        "temperature": 0.7,
+        "stream": True,
+        "system": None,
+        "persona": None,
+        "max_tokens": None,
+    }
+    if CONFIG_FILE.exists():
+        try:
+            with open(CONFIG_FILE) as f:
+                for line in f:
+                    line = line.strip()
+                    if line and not line.startswith("#") and "=" in line:
+                        key, _, val = line.partition("=")
+                        key = key.strip()
+                        val = val.strip().strip('"').strip("'")
+                        if key in cfg:
+                            cfg[key] = val
+        except Exception:
+            pass
+    return cfg
+
+
+def resolve_api_key(provider):
+    """Resolve API key from env or config file."""
+    provider_info = PROVIDERS.get(provider, PROVIDERS["openrouter"])
+    env_key = provider_info["env_key"]
+    key = os.getenv(env_key, "")
+
+    # Also check ~/.oxrc for api_key=xxx
+    if not key and CONFIG_FILE.exists():
+        try:
+            with open(CONFIG_FILE) as f:
+                for line in f:
+                    line = line.strip()
+                    if line.startswith(f"{provider}_api_key=") or line.startswith("api_key="):
+                        _, _, val = line.partition("=")
+                        key = val.strip().strip('"').strip("'")
+                        break
+        except Exception:
+            pass
+
+    return key
+
+
+# ─── Core ───────────────────────────────────────────────────
+def stream_response(url, headers, payload, provider="openrouter"):
+    """Stream response from OpenAI-compatible endpoint. Yields delta strings."""
+    data = json.dumps(payload).encode("utf-8")
+    ctx = ssl.create_default_context()
+    req = urllib.request.Request(url, data=data, headers=headers, method="POST")
+
+    try:
+        with urllib.request.urlopen(req, context=ctx) as response:
+            for line in response:
+                line = line.decode("utf-8").strip()
+                if not line:
+                    continue
+                if line.startswith("data: "):
+                    data_str = line[6:]
+                    if data_str == "[DONE]":
+                        break
+                    try:
+                        chunk = json.loads(data_str)
+                        choices = chunk.get("choices", [])
+                        if choices:
+                            delta = choices[0].get("delta", {})
+                            content = delta.get("content", "")
+                            if content:
+                                yield content
+                    except json.JSONDecodeError:
+                        continue
+    except urllib.error.HTTPError as e:
+        error_body = e.read().decode("utf-8", errors="replace")
+        err_msg = error_body
+        # If this is a model_not_found on OpenRouter, try the pool keys
+        if provider == "openrouter" and e.code == 404 and "model_not_found" in error_body.lower():
+            pool = os.environ.get("OPENROUTER_API_KEY_POOL", "")
+            if pool:
+                for k in pool.split(","):
+                    k = k.strip()
+                    if not k or "PLACEHOLDER" in k:
+                        continue
+                    h2 = dict(headers)
+                    h2["Authorization"] = f"Bearer {k}"
+                    try:
+                        req2 = urllib.request.Request(url, data=data, headers=h2, method="POST")
+                        with urllib.request.urlopen(req2, context=ctx) as r2:
+                            for line2 in r2:
+                                line2 = line2.decode("utf-8").strip()
+                                if not line2 or not line2.startswith("data: "):
+                                    continue
+                                data_str2 = line2[6:]
+                                if data_str2 == "[DONE]":
+                                    break
+                                try:
+                                    chunk2 = json.loads(data_str2)
+                                    choices2 = chunk2.get("choices", [])
+                                    if choices2:
+                                        delta2 = choices2[0].get("delta", {})
+                                        content2 = delta2.get("content", "")
+                                        if content2:
+                                            yield content2
+                                except json.JSONDecodeError:
+                                    continue
+                        return
+                    except urllib.error.HTTPError:
+                        continue
+        print(f"\n[API Error {e.code}] {err_msg[:500]}", file=sys.stderr)
+        sys.exit(1)
+    except urllib.error.URLError as e:
+        print(f"\n[Connection Error] {e.reason}", file=sys.stderr)
+        sys.exit(1)
+
+
+def fetch_response(url, headers, payload, provider="openrouter"):
+    """Non-streaming fetch. Returns (content, usage_info)."""
+    data = json.dumps(payload).encode("utf-8")
+    ctx = ssl.create_default_context()
+    req = urllib.request.Request(url, data=data, headers=headers, method="POST")
+
+    try:
+        with urllib.request.urlopen(req, context=ctx) as response:
+            body = json.loads(response.read().decode("utf-8"))
+            content = body["choices"][0]["message"]["content"]
+            usage = body.get("usage", {})
+            return content, usage
+    except urllib.error.HTTPError as e:
+        error_body = e.read().decode("utf-8", errors="replace")
+        # If this is a model_not_found on OpenRouter, try the pool keys
+        if provider == "openrouter" and e.code == 404 and "model_not_found" in error_body.lower():
+            pool = os.environ.get("OPENROUTER_API_KEY_POOL", "")
+            if pool:
+                for k in pool.split(","):
+                    k = k.strip()
+                    if not k or "PLACEHOLDER" in k:
+                        continue
+                    h2 = dict(headers)
+                    h2["Authorization"] = f"Bearer {k}"
+                    try:
+                        req2 = urllib.request.Request(url, data=data, headers=h2, method="POST")
+                        with urllib.request.urlopen(req2, context=ctx) as r2:
+                            body2 = json.loads(r2.read().decode("utf-8"))
+                            return body2["choices"][0]["message"]["content"], body2.get("usage", {})
+                    except urllib.error.HTTPError:
+                        continue
+        print(f"\n[API Error {e.code}] {error_body[:500]}", file=sys.stderr)
+        sys.exit(1)
+    except urllib.error.URLError as e:
+        print(f"\n[Connection Error] {e.reason}", file=sys.stderr)
+        sys.exit(1)
+
+
+def chat(args):
+    """Main chat flow."""
+    config = load_config()
+
+    # Resolve provider
+    provider = args.provider or config.get("provider", "openrouter")
+    if provider not in PROVIDERS:
+        print(f"[Error] Unknown provider '{provider}'. Options: {list(PROVIDERS)}", file=sys.stderr)
+        sys.exit(1)
+
+    provider_info = PROVIDERS[provider]
+
+    # Resolve API key
+    api_key = resolve_api_key(provider)
+    if not api_key:
+        env_key = provider_info["env_key"]
+        print(f"[Error] {env_key} not set.", file=sys.stderr)
+        if provider == "openrouter":
+            print("Get a free key at: https://openrouter.ai/keys", file=sys.stderr)
+        elif provider == "groq":
+            print("Get a free key at: https://console.groq.com/keys", file=sys.stderr)
+        print(f"Then: export {env_key}='sk-...'", file=sys.stderr)
+        sys.exit(1)
+
+    # Resolve model
+    model = args.model or config.get("model") or provider_info["default_model"]
+
+    # Resolve system prompt
+    system = None
+    if args.persona:
+        persona = PERSONAS.get(args.persona)
+        if persona:
+            system = persona["system"]
+        else:
+            print(f"[Warning] Unknown persona '{args.persona}'. Options: {list(PERSONAS)}", file=sys.stderr)
+    if args.system:
+        system = args.system
+    if system is None and config.get("system"):
+        system = config["system"]
+
+    # Build prompt from args or stdin
+    prompt = " ".join(args.prompt)
+    if not prompt and not sys.stdin.isatty():
+        prompt = sys.stdin.read().strip()
+
+    if not prompt:
+        print("Usage: ox \"<prompt>\" OR cat file.py | ox \"explain this\"", file=sys.stderr)
+        sys.exit(1)
+
+    # Temperature
+    temp = args.temperature if args.temperature is not None else float(config.get("temperature", 0.7))
+
+    # Build messages
+    messages = []
+    if system:
+        messages.append({"role": "system", "content": system})
+    messages.append({"role": "user", "content": prompt})
+
+    # Build payload
+    max_tokens_val = args.max_tokens or config.get("max_tokens")
+    if max_tokens_val is None:
+        max_tokens_val = provider_info.get("max_tokens_default", 2048)
+    payload = {
+        "model": model,
+        "messages": messages,
+        "temperature": temp,
+        "stream": args.stream,
+        "max_tokens": int(max_tokens_val),
+    }
+
+    # Headers
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+    headers.update(provider_info.get("headers_extra", {}))
+
+    url = args.endpoint or provider_info["url"]
+
+    # Execute
+    if args.stream:
+        for chunk in stream_response(url, headers, payload, provider):
+            sys.stdout.write(chunk)
+            sys.stdout.flush()
+        print()  # trailing newline
+    else:
+        content, usage = fetch_response(url, headers, payload, provider)
+        if args.json:
+            print(json.dumps({"content": content, "usage": usage}, indent=2))
+        else:
+            print(content)
+            if args.verbose:
+                print(f"\n--- Tokens: {usage.get('total_tokens', '?')} "
+                      f"(prompt: {usage.get('prompt_tokens', '?')}, "
+                      f"completion: {usage.get('completion_tokens', '?')})",
+                      file=sys.stderr)
+
+
+def list_models(args):
+    """List recommended models."""
+    provider_filter = args.models_provider
+    print(f"{'Provider':<16} {'Model':<40} {'Description'}")
+    print("-" * 85)
+    for prov, model, desc in FREE_MODELS:
+        if provider_filter and prov != provider_filter:
+            continue
+        key_env = PROVIDERS[prov]["env_key"]
+        has_key = bool(os.getenv(key_env, ""))
+        status = "✓" if has_key else "○"
+        print(f"  {status} {prov:<13} {model:<40} {desc}")
+
+
+def list_free_models(args):
+    """Live OpenRouter free catalog, sorted by context window."""
+    import urllib.request
+    try:
+        req = urllib.request.Request(
+            "https://openrouter.ai/api/v1/models", headers={"User-Agent": "ox/1.0"})
+        models = json.loads(urllib.request.urlopen(req, timeout=25).read())["data"]
+    except Exception as e:
+        print(f"catalog fetch failed: {e}")
+        return
+    free = []
+    for m in models:
+        p = m.get("pricing", {})
+        if p.get("prompt") == "0" and p.get("completion") == "0":
+            free.append((m.get("id", ""), m.get("context_length") or 0))
+    free.sort(key=lambda r: -r[1])
+    print(f"{'Model':<52} {'Context':>10}")
+    print("-" * 64)
+    for mid, ctx in free:
+        print(f"  {mid:<50} {ctx:>10,}")
+    print(f"\n{len(free)} free models (default: {PROVIDERS['openrouter']['default_model']})")
+
+
+def init_config(args):
+    """Create ~/.oxrc with defaults."""
+    if CONFIG_FILE.exists() and not args.init_force:
+        print(f"~/.oxrc already exists. Use --force to overwrite.")
+        return
+    cfg = (
+        "# ox CLI configuration\n"
+        "# Lines: key=value (no spaces around =)\n\n"
+        "provider=groq\n"
+        "model=openai/gpt-oss-120b\n"
+        "# temperature=0.7\n"
+        "# persona=mikey\n"
+        "# openrouter_api_key=sk-or-v1-...\n"
+        "# groq_api_key=gsk_...\n"
+    )
+    CONFIG_FILE.write_text(cfg)
+    print(f"Created ~/.oxrc")
+
+
+# ─── CLI ─────────────────────────────────────────────────────
+def main():
+    parser = argparse.ArgumentParser(
+        prog="ox",
+        description="Lightweight OpenRouter/Groq CLI — cloud model inference for low-memory devices.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Examples:\n"
+            "  ox \"fix this bug\"\n"
+            "  cat main.py | ox \"review for security issues\"\n"
+            "  ox --model qwen/qwen-3-32b --system \"Be terse\" \"explain monads\"\n"
+            "  ox --groq --json \"write a fibonacci function\"\n"
+            "  ox --persona mikey \"analyze this architecture\"\n"
+            "  ox --models\n"
+            "  ox --init\n"
+            "  ox --version\n\n"
+            f"Config: ~/.oxrc   Version: {VERSION}"
+        ),
+    )
+
+    # Prompt (positional, consumes remaining args)
+    parser.add_argument("prompt", nargs="*", help="Prompt text (or pipe via stdin)")
+    parser.add_argument("--model", "-m", help="Model ID (default: provider config)")
+    parser.add_argument("--system", "-s", help="System prompt")
+    parser.add_argument("--persona", "-p", choices=list(PERSONAS), help="Inject a persona")
+    parser.add_argument("--temperature", "-t", type=float, help="Temperature (0-2, default 0.7)")
+    parser.add_argument("--max-tokens", "-M", type=int, help="Max completion tokens")
+    parser.add_argument("--provider", choices=["openrouter", "groq"], help="Provider (default: openrouter)")
+    parser.add_argument("--groq", action="store_true", help="Shortcut for --provider groq")
+    parser.add_argument("--endpoint", help="Custom API endpoint URL")
+    parser.add_argument("--no-stream", dest="stream", action="store_false", help="Non-streaming mode")
+    parser.add_argument("--json", action="store_true", help="Output as JSON (implies --no-stream)")
+    parser.add_argument("--verbose", "-v", action="store_true", help="Show token usage (stderr)")
+    parser.add_argument("--version", action="store_true", help="Print version")
+    parser.add_argument("--models", action="store_true", help="List recommended models")
+    parser.add_argument("--free-models", action="store_true", help="List the LIVE OpenRouter free catalog (ctx-sorted)")
+    parser.add_argument("--models-provider", choices=["openrouter", "groq"], help="Filter --models by provider")
+    parser.add_argument("--init", action="store_true", help="Create ~/.oxrc config file")
+    parser.add_argument("--init-force", action="store_true", help="Force overwrite existing ~/.oxrc")
+    parser.set_defaults(stream=True)
+
+    args = parser.parse_args()
+
+    # Version
+    if args.version:
+        print(f"ox v{VERSION}")
+        return
+
+    # --groq shortcut
+    if args.groq:
+        args.provider = "groq"
+
+    # --json implies non-streaming
+    if args.json:
+        args.stream = False
+
+    # Dispatch flags
+    if args.models:
+        list_models(args)
+    elif args.free_models:
+        list_free_models(args)
+    elif args.init:
+        init_config(args)
+    else:
+        chat(args)
+
+
+if __name__ == "__main__":
+    main()

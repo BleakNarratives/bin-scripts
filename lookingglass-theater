@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+set -e
+# opens theater after ensuring it exists
+python3 ~/tools/lookingglass/lookingglass.py --theater >/dev/null 2>&1 || true
+FILE="$HOME/tools/lookingglass/theater/theater.html"
+if command -v xdg-open >/dev/null 2>&1; then xdg-open "$FILE" 2>/dev/null || echo "Open: $FILE"
+else echo "Open: $FILE"
+fi
