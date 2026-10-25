@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+# toolrun -- run any command and record one telemetry event with its real exit
+# status. This is the coverage path for tools that cannot import telemetry.py
+# themselves (shell scripts, other people's CLIs, one-off python files).
+#
+#   bin/toolrun python3 bin/check_key_health.py --json
+#   bin/toolrun ./some_script.sh
+#
+# The event is written by telemetry.py --log, which reads the live Thoth bus
+# availability in its own process. If telemetry cannot write, this still
+# returns the wrapped command's status: measuring must never change behaviour.
+set -uo pipefail
+
+if [ "$#" -eq 0 ]; then
+    echo "usage: $(basename "$0") <command> [args...]" >&2
+    exit 2
+fi
+
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+tool="$(basename "$1")"
+start=$(date +%s)
+
+"$@"
+rc=$?
+dur=$(( $(date +%s) - start ))
+
+python3 "$here/telemetry.py" --log --tool "toolrun:$tool" --rc "$rc" \
+    --detail "dur=${dur}s via toolrun" >/dev/null 2>&1 || true
+
+exit "$rc"

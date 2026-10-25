@@ -55,13 +55,113 @@ RESET = "\033[0m"
 
 # ─── live catalog pullers ───────────────────────────────────
 
-def _get(url, token=None):
+def _get(url, token=None, extra_headers=None):
     headers = {"User-Agent": "model_scout/1.0"}
     if token:
         headers["Authorization"] = f"Bearer {token}"
+    if extra_headers:
+        headers.update(extra_headers)
     req = urllib.request.Request(url, headers=headers)
     with urllib.request.urlopen(req, timeout=30) as resp:
         return json.load(resp)
+
+
+def _vault_key(provider: str) -> str:
+    """Key from the vault when the env is not loaded.
+
+    The pullers used to read only os.environ, so a vault holding a perfectly
+    good key reported NO_KEY unless vault-env had been sourced. That is why the
+    registry stayed blind to providers that actually worked.
+    """
+    entry = (_vault().get("keys") or {}).get(provider)
+    if not isinstance(entry, dict) or entry.get("status") in ("dead", "revoked"):
+        return ""
+    return (entry.get("key") or "").split(",")[0].strip()
+
+
+def _vault() -> dict:
+    try:
+        return json.loads((Path.home() / ".concierge" / "vault.json")
+                          .read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def pull_gemini():
+    key = (os.environ.get("GEMINI_API_KEY", "").strip() or _vault_key("gemini"))
+    if not key:
+        return {"status": "NO_KEY"}
+    try:
+        data = _get("https://generativelanguage.googleapis.com/v1beta/models",
+                    extra_headers={"x-goog-api-key": key})
+        rows = [m for m in data.get("models", [])
+                if "generateContent" in (m.get("supportedGenerationMethods") or [])]
+        return {"status": "LIVE", "models": sorted(m["name"].split("/")[-1] for m in rows),
+                "count": len(rows)}
+    except urllib.error.HTTPError as e:
+        return {"status": f"HTTP_{e.code}"}
+    except Exception as e:
+        return {"status": "ERROR", "detail": str(e)[:120]}
+
+
+def pull_huggingface():
+    """Public catalog; the token is only used to confirm the account."""
+    key = (os.environ.get("HF_TOKEN", "").strip() or _vault_key("huggingface"))
+    out = {"status": "LIVE", "note": "catalog is public; no key needed to read"}
+    if key:
+        try:
+            who = _get("https://huggingface.co/api/whoami-v2", key)
+            out["account"] = who.get("name", "?")
+            out["plan"] = who.get("plan", "") or "free"
+        except urllib.error.HTTPError as e:
+            out["token"] = f"HTTP_{e.code}"
+        except Exception as e:
+            out["token"] = f"ERROR_{type(e).__name__}"
+    else:
+        out["token"] = "NO_KEY"
+    try:
+        trend = _get("https://huggingface.co/api/models?sort=downloads&limit=5")
+        out["top_downloads"] = [m.get("modelId", m.get("id", "")) for m in trend]
+    except Exception as e:
+        out["catalog"] = f"ERROR_{type(e).__name__}"
+    return out
+
+
+def pull_ai2():
+    """Allen Institute for AI -- published on Hugging Face, no first-party API."""
+    try:
+        rows = _get("https://huggingface.co/api/models?author=allenai"
+                    "&sort=downloads&limit=8")
+        return {"status": "LIVE", "source": "huggingface:allenai",
+                "models": [r.get("modelId", r.get("id", "")) for r in rows],
+                "count": len(rows),
+                "note": "weights only; inference is not hosted by AI2"}
+    except Exception as e:
+        return {"status": "ERROR", "detail": str(e)[:120]}
+
+
+def pull_hf_domains():
+    """Free-domain catalogs that matter for science, medicine and robotics."""
+    domains = {
+        "robotics": "robotics",
+        "medical": "medical",
+        "biology": "biology",
+        "chemistry": "chemistry",
+        "climate": "climate",
+        "audio": "audio",
+    }
+    out = {"status": "LIVE", "source": "huggingface tags", "domains": {}}
+    for label, tag in domains.items():
+        try:
+            rows = _get(f"https://huggingface.co/api/models?filter={tag}"
+                        "&sort=downloads&limit=5")
+            out["domains"][label] = {
+                "count_shown": len(rows),
+                "top": [r.get("modelId", r.get("id", "")) for r in rows],
+            }
+        except Exception as e:
+            out["domains"][label] = {"error": type(e).__name__}
+    return out
 
 
 def pull_openrouter():
@@ -233,6 +333,10 @@ def build_registry():
             "cohere": pull_cohere(),
             "zai": pull_zai(),
             "cloudflare": pull_cloudflare(),
+            "gemini": pull_gemini(),
+            "huggingface": pull_huggingface(),
+            "ai2": pull_ai2(),
+            "hf_domains": pull_hf_domains(),
         },
         "curated_lanes": CURATED_LANES,
         "tools": {
@@ -294,4 +398,6 @@ def main():
 
 
 if __name__ == "__main__":
+    import telemetry
+    telemetry.install("model_scout", sys.argv[1:])
     main()
