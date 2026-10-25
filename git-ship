@@ -1,0 +1,112 @@
+#!/usr/bin/env bash
+# git-ship -- one gate for the checks a commit must not skip.
+#
+# Runs against the STAGED set only, so pre-existing debt elsewhere in a large
+# tree cannot block an unrelated commit. Order is cheapest-first: syntax, then
+# secrets, then larp, then tests.
+#
+#   bin/git-ship                # default: syntax + secrets + larp + fast tests
+#   bin/git-ship --full         # the same, plus the whole home test suite (~30s)
+#   bin/git-ship --no-tests     # everything except tests
+#   bin/git-ship --strict-larp  # also block on advisory prose findings
+#
+# Install as a hook where a repo has none:
+#   ln -sf "$HOME/bin/git-ship" .git/hooks/pre-commit
+#
+# Honest about the clock: the fast path is a few seconds because it runs the
+# contract and tooling tests, not 650 of them. --full exists because "the gate
+# passed" should be able to mean the whole suite when you want it to.
+set -uo pipefail
+
+ROOT="$(git rev-parse --show-toplevel 2>/dev/null)" || {
+    echo "git-ship: not inside a git repository" >&2; exit 1; }
+cd "$ROOT" || exit 1
+
+FULL=0
+TESTS=1
+STRICT_LARP=0
+for arg in "$@"; do
+    case "$arg" in
+        --full) FULL=1 ;;
+        --no-tests) TESTS=0 ;;
+        --strict-larp) STRICT_LARP=1 ;;
+        -h|--help) sed -n '2,20p' "$0"; exit 0 ;;
+        *) echo "git-ship: unknown option $arg" >&2; exit 2 ;;
+    esac
+done
+
+mapfile -t STAGED < <(git diff --cached --name-only --diff-filter=ACM)
+if [ "${#STAGED[@]}" -eq 0 ]; then
+    echo "git-ship: nothing staged"
+    exit 0
+fi
+
+fail() { echo "git-ship: BLOCKED -- $*" >&2; exit 1; }
+PY=()
+for f in "${STAGED[@]}"; do
+    case "$f" in *.py) [ -f "$f" ] && PY+=("$f") ;; esac
+done
+
+# 1. syntax ---------------------------------------------------------------
+if [ "${#PY[@]}" -gt 0 ]; then
+    python3 -m py_compile "${PY[@]}" || fail "staged Python does not compile"
+    echo "git-ship: compile ok (${#PY[@]} file(s))"
+fi
+
+# 2. secrets --------------------------------------------------------------
+# Key shapes only, not the word "key". Matches the scanners used elsewhere:
+# an assertion like `assert key == "..."` in a test is a fixture, so short
+# filler runs like ABCDEFG are not matched by the length floors below.
+SECRET_RE='(sk-[A-Za-z0-9_-]{24,}|gsk_[A-Za-z0-9]{24,}|AIza[0-9A-Za-z_-]{30,}|hf_[A-Za-z0-9]{24,}|csk-[A-Za-z0-9]{24,}|sk-or-v1-[A-Za-z0-9]{24,}|gh[pousr]_[A-Za-z0-9]{30,}|xox[baprs]-[A-Za-z0-9-]{20,}|-----BEGIN [A-Z ]*PRIVATE KEY-----)'
+hits=$(grep -nEI "$SECRET_RE" -- "${STAGED[@]}" 2>/dev/null || true)
+if [ -n "$hits" ]; then
+    echo "$hits" | sed 's/^/  /' >&2
+    fail "possible secret material in staged files"
+fi
+echo "git-ship: secret scan ok (${#STAGED[@]} file(s))"
+
+# 3. larp ----------------------------------------------------------------
+LARP="$HOME/turd-merger-tools/larp_scan.py"
+if [ -f "$LARP" ] && [ "${#PY[@]}" -gt 0 ]; then
+    mapfile -t DIRS < <(printf '%s\n' "${PY[@]}" | xargs -r -n1 dirname | sort -u)
+    out=$(python3 "$LARP" "${DIRS[@]}" 2>&1)
+    blocking=$(echo "$out" | grep -cE "assertion-free-test|trivial-assertion" || true)
+    advisory=$(echo "$out" | grep -c "claim-without-receipt" || true)
+    if [ "$STRICT_LARP" -eq 1 ] && [ "$blocking" -eq 0 ] && [ "$advisory" -gt 0 ]; then
+        blocking=$advisory
+    fi
+    if [ "$blocking" -gt 0 ]; then
+        echo "$out" | grep -E "assertion-free-test|trivial-assertion" | head -15 >&2
+        fail "$blocking test(s) that cannot fail"
+    fi
+    # claim-without-receipt matches the word "verified" in any nearby comment,
+    # including true ones. Blocking on it makes every honest docstring a
+    # blocker, and a gate people bypass with --no-verify is worse than no gate.
+    # It is reported; --strict-larp turns it into a blocker when you want that.
+    echo "git-ship: larp ok (0 tests that cannot fail, $advisory advisory prose finding(s))"
+else
+    echo "git-ship: larp scan skipped (no scanner or no Python staged)"
+fi
+
+# 4. tests ---------------------------------------------------------------
+if [ "$TESTS" -eq 1 ]; then
+    if [ "$FULL" -eq 1 ]; then
+        out=$(cd "$HOME" && timeout 900 python3 -m unittest discover -s tests 2>&1)
+        rc=$?
+        summary=$(echo "$out" | grep -E "^(Ran |OK|FAILED)" | tr '\n' ' ')
+        [ $rc -ne 0 ] && { echo "$out" | tail -25 >&2; fail "full suite failed: $summary"; }
+        echo "git-ship: full suite ok ($summary)"
+    elif [ -f "$HOME/tests/test_grim_contract.py" ]; then
+        out=$(cd "$HOME" && timeout 180 python3 -m unittest \
+              tests.test_grim_contract tests.test_telemetry \
+              tests.test_ingest_keys 2>&1)
+        rc=$?
+        summary=$(echo "$out" | grep -E "^(Ran |OK|FAILED)" | tr '\n' ' ')
+        [ $rc -ne 0 ] && { echo "$out" | tail -25 >&2; fail "targeted tests failed: $summary"; }
+        echo "git-ship: targeted tests ok ($summary)"
+        echo "git-ship: (use --full for all 650+ tests)"
+    fi
+fi
+
+echo "git-ship: PASSED -- $ROOT"
+exit 0
