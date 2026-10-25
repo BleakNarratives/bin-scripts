@@ -128,5 +128,5 @@ def main(argv=None) -> int:
 
 if __name__ == "__main__":
     import telemetry
-    telemetry.install("verify_keys")
+    telemetry.install("verify_keys", sys.argv[1:])
     sys.exit(main())
