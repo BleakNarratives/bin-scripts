@@ -75,6 +75,11 @@ def main(argv=None) -> int:
             continue
         if wanted and provider not in wanted:
             continue
+        if entry.get("status") == "retired":
+            # Kept so the bytes are not silently destroyed, excluded so they
+            # stop appearing as work to do. Nothing should claim these work.
+            print(f"{provider:14} retired; not probed")
+            continue
         pool = [k.strip() for k in str(entry.get("key") or "").split(",") if k.strip()]
         if not pool:
             print(f"{provider:14} no key")

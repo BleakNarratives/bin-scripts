@@ -283,3 +283,14 @@ advisory prose findings blocking.
 does not: it fires on the word "verified" in any nearby comment, including true
 ones, and a gate that blocks honest docstrings gets `--no-verify`'d. A bypassed
 gate is worse than no gate.
+
+### Vault debt closed (2026-10-25)
+
+Five entries are `retired` rather than deleted, so the bytes survive and
+nothing claims they work: `bazaar`, `sageox`, `zenmux`, `puter`, `unknown`.
+The reason is recorded in each entry's `status_note`. Three of those domains
+(`bazaar.ai`, `sageox.com`, `vibe.ai`) resolve to parking IPs — they are
+for-sale domains, not API providers, which is why no probe could ever validate
+them. `verify_keys.py` skips retired entries and says so.
+
+Final state: 15 entries — 9 `live`, 1 `dead` (sambanova, 401), 5 `retired`.
