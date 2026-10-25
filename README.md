@@ -234,3 +234,52 @@ A provider with no key is inert, so adding one early is harmless.
   session does not re-derive them.
 - `~/docs/PROVIDER_ENDPOINTS.md` — where to get keys and what each provider needs.
 - Ledgers for this directory: `bin/WHO_DID_WHAT.md`.
+
+## Vault tooling and the commit gate (2026-10-25)
+
+Four scripts are the operational truth for keys, and they live here, not in the
+home repo (`~/bin` is its own git repo, `bin-scripts`, branch `master`):
+
+| script | what it answers |
+|---|---|
+| `ingest_keys.py` | where does this pasted key belong? Dry-run unless `--write` |
+| `verify_keys.py` | which vault keys actually work right now? `--apply` records it |
+| `model_scout.py` | what models can these keys reach? Writes `RootBase/model_registry.json` |
+| `usage_report.py` | is any of this actually used? Static, reference and runtime evidence, kept apart |
+
+Rules worth not relearning:
+
+- A key is only assigned when a provider is anchored to it. Ambiguous `sk-...`
+  keys are reported, never guessed. A label that contradicts a unique key shape
+  is a conflict, not an instruction.
+- **A probe must be able to fail.** An endpoint qualifies only if it rejects
+  both a missing and a deliberately bogus key. `sambanova`, `zenmux`, `bazaar`,
+  `sageox` and `puter` cannot meet that bar today and are listed in `NO_PROBE`
+  with the reason. `verify_keys.py` writes `probe: validated|unsupported` next
+  to each status so the absence of a verdict is visible.
+- Never print a key. `mask()` gives a 4/3 preview plus an 8-char sha256 prefix;
+  fingerprints are how duplicates are detected (`cohere`, `elevenlabs`,
+  `stability` and `aimlapi` all held DeepSeek's key, `jules` held Gemini's,
+  `vibe` held Mistral's).
+
+### Telemetry
+
+`telemetry.py` appends one row per tool run to
+`RootBase/logs/shared/bin_tools/events.tsv` (`stamp, tool, rc, dur_s,
+bus_available, detail`). Deliberately **not** Thoth's `thoth_bus.tsv`: folding
+tool runs into the bus-availability log would inflate a number that measures
+something else. Coverage is honest — only tools that call `install()` (the four
+above) or run through `toolrun` appear; absence reads as "not instrumented",
+never as "never used".
+
+### The gate
+
+`git-ship` chains compile → secret scan → larp → tests over the **staged set**,
+and is installed as `pre-commit` in `~/bin`, `~/grim-oracle` and
+`~/turd-merger-tools`. `--full` runs the whole home suite; `--strict-larp` makes
+advisory prose findings blocking.
+
+`assertion-free-test` and `trivial-assertion` block. `claim-without-receipt`
+does not: it fires on the word "verified" in any nearby comment, including true
+ones, and a gate that blocks honest docstrings gets `--no-verify`'d. A bypassed
+gate is worse than no gate.
