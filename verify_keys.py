@@ -51,7 +51,7 @@ def main(argv=None) -> int:
     keys = blob.get("keys") or {}
     wanted = {s.strip() for s in a.only.split(",") if s.strip()}
 
-    rows, changes = [], 0
+    rows, changes, meta = [], 0, 0
     legacy = [p for p, e in keys.items() if not isinstance(e, dict)]
     # A key filed under two providers is the signature of the old unanchored
     # ingest: one token, several slots, at most one of them usable. Detect it
@@ -84,6 +84,11 @@ def main(argv=None) -> int:
             flag = " UNSUPPORTED" if entry.get("status") == "live" else ""
             print(f"{provider:14} {len(pool)} key(s)  no probe ({why}); "
                   f"left as {entry.get('status', 'unknown')}{flag}")
+            # Record the absence of a verdict so a later reader does not have to
+            # reconstruct why this provider was never checked.
+            if a.apply and entry.get("probe") != "unsupported":
+                entry["probe"] = "unsupported"
+                meta += 1
             continue
         result = probe(provider, pool[0])
         target = suggest(result)
@@ -91,6 +96,9 @@ def main(argv=None) -> int:
         print(f"{provider:14} {len(pool)} key(s)  probe={result:<12}"
               f"status={entry.get('status', '?'):<11}{note}  {mask(pool[0])}")
         rows.append({"provider": provider, "probe": result, "suggest": target})
+        if a.apply and entry.get("probe") != "validated":
+            entry["probe"] = "validated"
+            meta += 1
         if a.apply and target and entry.get("status") != target:
             entry["status"] = target
             entry["verified"] = date.today().isoformat()
@@ -114,11 +122,12 @@ def main(argv=None) -> int:
         print("legacy entries need `--migrate-legacy` or manual placement:",
               ", ".join(sorted(legacy)))
     if a.apply:
-        if changes:
+        if changes or meta:
             tmp = path.with_suffix(".json.tmp")
             tmp.write_text(json.dumps(blob, indent=2), encoding="utf-8")
             tmp.replace(path)
-            print(f"updated {changes} status field(s) in {path}")
+            print(f"updated {changes} status field(s) and {meta} probe marker(s) "
+                  f"in {path}")
         else:
             print("no status changes")
     else:

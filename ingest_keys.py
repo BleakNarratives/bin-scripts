@@ -115,13 +115,21 @@ PROBES = {
     # validation (400/422), so it never generates a billed completion.
     "aimlapi": ("https://api.aimlapi.com/v1/chat/completions", "bearer",
                 "POST", "{}"),
+    # SambaNova's /v1/models is public and its chat endpoint validates the body
+    # before auth, so `{}` answers 400 for every key. Only a real model id and
+    # a real message reach the auth check -> 401 for a bad or missing key.
+    # This probe therefore sends one 1-token completion when the key is good.
+    # If the model id is retired the probe returns 404 and records nothing,
+    # rather than declaring the key dead.
+    "sambanova": ("https://api.sambanova.ai/v1/chat/completions", "bearer",
+                  "POST", '{"model": "DeepSeek-V3.1", "messages": '
+                          '[{"role": "user", "content": "hi"}], '
+                          '"max_tokens": 1}'),
 }
 
 # Providers with a vault entry but no trustworthy probe. Kept explicit so the
 # absence of a verdict is visible rather than silently reading as "fine".
 NO_PROBE = {
-    "sambanova": ("models list is public and ignores the key; chat endpoint "
-                  "validates the body before auth, so a bad key answers 400"),
     "bazaar": "no resolvable API host from this machine",
     "sageox": "no resolvable API host from this machine",
     "vibe": "no resolvable API host from this machine",
